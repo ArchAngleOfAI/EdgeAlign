@@ -137,10 +137,17 @@ fixed by any spec.
   - `soft_prompt_generator_spec_deploy.md` — v1, Phase 2 (8B edge) version
   - `soft_prompt_generator_spec_v2_self_embedding.md` — v2
   - `soft_prompt_generator_spec_v3_linear_attention_encoder.md` — v3
-- `files.zip` — a zip archive containing the same 5 files as `PROMPTS/`.
-  Appears to be a duplicate/backup of the PROMPTS folder rather than
-  distinct content. Left as-is; ask the user before removing it.
-- `edgealign_logo_v4.png` — project logo/branding asset.
+  - `soft_prompt_generator_infrastructure_spec.md` — instructional spec for
+    the infrastructure shared by v1/v2/v3 (prototype phase only): frozen
+    Qwen3 32B harness, injection mechanism, KL-distillation training loop,
+    init scheme, and dataset download/prep (Stack-Edu, OpenCodeInstruct,
+    xLAM), with the generator front-end as a pluggable interface
+- `files.zip` — a zip archive containing the same 5 original files as
+  `PROMPTS/` (predates the infrastructure spec). Appears to be a
+  duplicate/backup of the PROMPTS folder rather than distinct content.
+  Committed as-is; ask the user before removing it.
+- `edgealign_logo_v4.png` — project logo/branding asset, embedded in
+  README.md.
 - No source code exists yet as of 2026-09-14 — project is at the
   spec-authoring stage.
 
@@ -148,6 +155,14 @@ fixed by any spec.
 
 - Repo did not exist before 2026-09-14; initialized fresh by the agent that
   day (`git init`), default branch renamed `master` → `main`.
-- No remote configured yet.
-- Per AGENT.md, the agent does not commit automatically — it stages/edits
-  and notifies the user that a commit is pending.
+- Remote `origin` → `git@github.com:ArchAngleOfAI/EdgeAlign.git` (SSH).
+  Local `main` tracks `origin/main`.
+- Commit identity (local to this repo, not global git config):
+  `ArchAngleOfAI <ArchAngleOfAI@users.noreply.github.com>` — the user's own
+  email is deliberately not used for commits.
+- SSH auth for this machine: key at `~/.ssh/id_ed25519_github`, pinned to
+  `github.com` via `~/.ssh/config`, public key added to the user's GitHub
+  account by the user.
+- Initial commit `8349752` pushed 2026-09-14, containing all files above.
+- Per AGENT.md, the agent does not commit or push automatically — it
+  stages/edits and notifies the user, and confirms before pushing.
