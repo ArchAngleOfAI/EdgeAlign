@@ -148,8 +148,77 @@ fixed by any spec.
   Committed as-is; ask the user before removing it.
 - `edgealign_logo_v4.png` — project logo/branding asset, embedded in
   README.md.
-- No source code exists yet as of 2026-09-14 — project is at the
-  spec-authoring stage.
+- `edgealign/` — the shared infrastructure implementation (see
+  "Implementation status" below).
+- `configs/prototype_32b.yaml` — real cluster training config.
+- `scripts/run_smoke_test.py` — local CPU smoke test, no downloads.
+- `scripts/prepare_stack_edu.py` — offline Stack-Edu content resolution,
+  meant to run once on the cluster.
+- `requirements.txt`, `.gitignore` — Python deps and ignore rules
+  (`.venv/`, `checkpoints/`, `__pycache__/`).
+- `.claude/skills/push-changes/SKILL.md` — user-invoked (`/push-changes`)
+  skill for committing/pushing in logically-grouped commits; never sets
+  up CI/CD.
+
+## Implementation status (as of 2026-09-14)
+
+The shared infrastructure from
+`soft_prompt_generator_infrastructure_spec.md` is implemented in
+`edgealign/`:
+
+- `frozen_model.py` — `FrozenLLMHarness`: loads a frozen causal LM
+  (`.from_pretrained` for real runs), exposes `teacher_pass` (no-grad,
+  plain prompt) and `student_pass` (soft prefix injected, gradients flow
+  through the frozen model's activations into the prefix even though its
+  own params never update).
+- `injection.py` — `inject_soft_prefix`: the embedding-space prepend
+  operation (spec section 2), used by `student_pass`.
+- `generators/base.py` — `GeneratorFrontend` interface (prompts+contexts
+  in, `(B, N, D)` tensor out). `generators/stub.py`'s
+  `MeanPoolStubGenerator` is a smoke-test-only placeholder (hash
+  tokenization + mean pool + tiny MLP) — **not** a v1/v2/v3 variant; no
+  variant has been chosen for implementation yet.
+- `losses.py` — `kl_distillation_loss` (KL(teacher‖student), teacher
+  forcing over one shared sequence stands in for "per generation step",
+  which is the standard tractable way to implement that) and
+  `embedding_scale_aux_loss` (norm-matching variant of the optional
+  auxiliary loss).
+- `init_utils.py` — samples real embedding mean/std/mean-norm from the
+  frozen model and rescales the generator's output layer to match (spec
+  section 5); handles the case where the output layer produces N tiled
+  copies of the embedding-dim stat.
+- `data/` — real loaders for all three sources exactly as documented in
+  the infra spec (`stack_edu.py` incl. S3 content resolution,
+  `opencodeinstruct.py`, `xlam.py`), `pipeline.py` mixing them via
+  `datasets.interleave_datasets`, and `synthetic.py` (a tiny hand-written
+  in-code corpus, local-smoke-test only, never a substitute for the real
+  mix).
+- `train.py` / `evaluate.py` — the actual training loop and held-out KL
+  tracking, config-driven (`config.py`, YAML).
+
+**Verified locally** (conda env `edgealign`, CPU-only, no GPU on this
+dev machine): `scripts/run_smoke_test.py` runs the real `run_training`
+loop against a tiny randomly-initialized `Qwen3ForCausalLM` (2 layers,
+hidden 32) and synthetic prompts — no network access, no dataset
+download, no real Qwen 3 weights. It asserts the loss stays finite and
+non-negative, the frozen tiny model's parameters are byte-for-byte
+unchanged after training, and the generator's parameters do change.
+Passed on first run (loss ~0.005–0.007 over 5 steps). All real-path
+modules (`data/pipeline.py`, `data/stack_edu.py`, etc.) were also
+confirmed to import cleanly and `configs/prototype_32b.yaml` parses
+correctly — but the real S3/HF downloads and the real 32B model were
+never invoked here, per instruction.
+
+**Not yet done / explicit next steps for the cluster run**:
+- No v1/v2/v3 variant is implemented — `generator.type` in
+  `prototype_32b.yaml` is still `dummy_stub` and must be swapped for a
+  real registered variant before a real training run.
+- `scripts/prepare_stack_edu.py` has never actually been run (needs AWS
+  credentials + real network access on the cluster).
+- No held-out validation split is wired into `configs/prototype_32b.yaml`
+  yet (eval_every is set, but `train.main()` doesn't currently pass a
+  separate `eval_data_iter` — would need a small addition before relying
+  on it for the real run).
 
 ## Git structure
 

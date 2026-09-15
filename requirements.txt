@@ -1,0 +1,11 @@
+torch>=2.2
+transformers>=4.51
+accelerate>=0.30
+datasets>=2.19
+pyyaml>=6.0
+numpy>=1.26
+
+# Needed only for Stack-Edu content resolution on the training cluster
+# (scripts/prepare_stack_edu.py) -- not required for local smoke testing.
+boto3>=1.34
+smart_open[s3]>=6.4

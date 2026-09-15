@@ -65,5 +65,51 @@ coverage), **OpenCodeInstruct** (paired instruction-and-code prompts), and
 
 - `PROMPTS/` — the source-of-truth spec documents for the generator
   architectures and training pipeline.
+- `edgealign/` — the shared infrastructure implementation (frozen-model
+  harness, embedding injection, KL-distillation training loop, init
+  scheme, dataset loaders) per
+  `PROMPTS/soft_prompt_generator_infrastructure_spec.md`. The generator
+  front-end (v1/v2/v3) is a pluggable interface
+  (`edgealign/generators/base.py`) — no variant is implemented yet;
+  `edgealign/generators/stub.py` is a smoke-test-only placeholder, not a
+  real variant.
+- `configs/prototype_32b.yaml` — the real config for the training
+  cluster (Qwen 3 32B, real datasets) — do not run it on a laptop.
+  `scripts/run_smoke_test.py` builds its own tiny, config-free setup and
+  runs entirely locally on CPU with no downloads.
+- `scripts/run_smoke_test.py` — runs the real training loop against a
+  tiny random Qwen3-architecture model and synthetic prompts, to verify
+  the plumbing without any GPU, download, or dataset access.
+- `scripts/prepare_stack_edu.py` — offline dataset prep for Stack-Edu
+  (resolves file content from the Software Heritage S3 mirror). Run this
+  once **on the cluster**, never locally — see spec section 6.1.
 - `MEMORY.md` / `SHORT_MEMORY.md` / `AGENT.md` — the project's persistent
   memory and agent operating instructions (see those files for details).
+
+## Running this
+
+Local (no GPU, no downloads, verifies plumbing only):
+
+```bash
+conda create -n edgealign python=3.11
+conda activate edgealign
+pip install -r requirements.txt
+python scripts/run_smoke_test.py
+```
+
+On the training cluster (real Qwen 3 32B, real data, A100s):
+
+```bash
+# once, before training:
+python scripts/prepare_stack_edu.py --output-dir /data/stack_edu_prepared
+
+# training:
+python -m edgealign.train --config configs/prototype_32b.yaml
+```
+
+`device_map: "auto"` in `configs/prototype_32b.yaml` shards the 32B
+frozen model across all GPUs visible on the node (via `accelerate`) — no
+manual multi-GPU/model-parallel code is needed for this "frozen giant
+model + tiny trainable generator" shape. No variant (v1/v2/v3) is
+selected yet, so `generator.type` is still the smoke-test stub; swap it
+for a real registered variant before running for real.

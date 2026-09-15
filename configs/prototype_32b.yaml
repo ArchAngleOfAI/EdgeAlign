@@ -1,0 +1,50 @@
+# Real prototype-phase training config -- meant for the A100 GPU cluster.
+# Do not run this on a local dev machine: it downloads/loads the full
+# Qwen 3 32B checkpoint and the real training corpora.
+#
+# generator.type is still "dummy_stub" -- no v1/v2/v3 variant has been
+# chosen for implementation yet. Replace it once one is registered in
+# edgealign/train.py's GENERATOR_REGISTRY.
+
+model:
+  name_or_path: "Qwen/Qwen3-32B"
+  dtype: "bfloat16"
+  device_map: "auto"   # shards the model across all visible A100s on the node
+  trust_remote_code: false
+
+generator:
+  type: "dummy_stub"
+  n_soft_tokens: 16
+  extra: {}
+
+data:
+  mode: "real"
+  max_seq_len: 1024
+  batch_size: 8
+  eval_fraction: 0.02   # held out for the KL-divergence success criterion (spec section 7)
+  max_eval_batches: 50
+  sources:
+    # Weights are a starting point (spec section 6.4 leaves the exact
+    # ratio tunable) -- retune once real training signal is available.
+    - name: "opencodeinstruct"
+      weight: 0.45
+      extra:
+        require_pass: true
+    - name: "xlam"
+      weight: 0.10
+      extra: {}
+    - name: "stack_edu"
+      weight: 0.45
+      extra:
+        # Must point at the output of scripts/prepare_stack_edu.py, run
+        # once on the cluster before starting training.
+        prepared_path: "/data/stack_edu_prepared"
+
+train:
+  learning_rate: 0.0001
+  max_steps: 20000
+  eval_every: 500
+  aux_loss_weight: 0.01
+  log_every: 20
+  seed: 0
+  output_dir: "checkpoints/prototype_run"

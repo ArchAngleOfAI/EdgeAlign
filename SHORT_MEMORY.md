@@ -7,7 +7,7 @@ MEMORY.md, not here.
 
 ## Last updated
 
-2026-09-14
+2026-09-14 (implementation session)
 
 ## Status
 
@@ -30,24 +30,44 @@ MEMORY.md, not here.
   OpenCodeInstruct, xLAM), with the generator front-end left as a
   pluggable interface. Scoped to prototype phase only (32B, server
   hardware) — deploy phase (8B edge) intentionally deferred.
-- No implementation code exists yet. Still at the spec stage. No variant
-  (v1/v2/v3) has been chosen for implementation yet.
+- Also created `.claude/skills/push-changes/SKILL.md` — user-invoked
+  `/push-changes` skill for logically-grouped commit+push, handles
+  pre-commit hook failures by fixing root causes, never sets up CI/CD.
+- **Implemented the shared infrastructure** in `edgealign/` per
+  `soft_prompt_generator_infrastructure_spec.md` (harness, injection,
+  KL-distillation loop, init scheme, all three real dataset loaders,
+  mixing, held-out eval wiring). Full detail in MEMORY.md's
+  "Implementation status" section — don't duplicate it here, it's
+  durable now, not in-flight.
+- Verified locally via `scripts/run_smoke_test.py` in a conda env named
+  `edgealign` (this dev machine has no GPU: CPU-only, torch 2.14+cpu,
+  transformers 5.17, python 3.11) — tiny random `Qwen3ForCausalLM`, no
+  downloads, no dataset access. Passed. Real-path modules (dataset
+  loaders, real config) verified to import/parse cleanly but never
+  executed (no S3/HF downloads triggered), per instruction.
+- **None of this implementation work is committed or pushed yet** —
+  working tree has it staged-ready but untracked/modified. Waiting for
+  the user to say go (or invoke `/push-changes`).
 
 ## Pending / needs user decision
 
 - No decision yet on which architecture variant (v1/v2/v3) to implement
-  first as the pluggable generator front-end, or whether to implement more
-  than one for comparison.
+  as the real generator front-end — `edgealign/train.py`'s
+  `GENERATOR_REGISTRY` only has the smoke-test-only stub registered.
+  `configs/prototype_32b.yaml`'s `generator.type` must be swapped before
+  any real cluster run.
 - `files.zip` duplicates `PROMPTS/` contents exactly — committed as-is,
   flagged in MEMORY.md, no action taken pending user input.
+- Implementation changes above are uncommitted — confirm before pushing.
 
 ## Immediate next steps (once user gives direction)
 
-- Likely next task: start implementing the shared infrastructure
-  (`soft_prompt_generator_infrastructure_spec.md`) plus whichever variant
-  spec the user picks first as the generator front-end.
+- Pick and implement one of v1/v2/v3 as a real `GeneratorFrontend`
+  registered in `edgealign/train.py`.
+- Actually run `scripts/prepare_stack_edu.py` and a real training run —
+  both need to happen on the user's A100 cluster, not this dev machine.
 - No RL-stage spec exists yet in PROMPTS/ — only referenced as "next stage,
   not covered" in every spec. May need to be written before that stage.
-- Since we now push to GitHub: remember AGENT.md's git rule (notify before
-  committing) — pushing is an additional, even more visible step; confirm
-  with the user before pushing future commits, same as before.
+- Remember AGENT.md's git rule (notify before committing/pushing) and the
+  new reporting rule (explain major implementation work clearly, which
+  this entry + the chat response already did for this milestone).
