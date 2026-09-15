@@ -210,15 +210,64 @@ correctly — but the real S3/HF downloads and the real 32B model were
 never invoked here, per instruction.
 
 **Not yet done / explicit next steps for the cluster run**:
-- No v1/v2/v3 variant is implemented — `generator.type` in
-  `prototype_32b.yaml` is still `dummy_stub` and must be swapped for a
-  real registered variant before a real training run.
 - `scripts/prepare_stack_edu.py` has never actually been run (needs AWS
   credentials + real network access on the cluster).
-- No held-out validation split is wired into `configs/prototype_32b.yaml`
-  yet (eval_every is set, but `train.main()` doesn't currently pass a
-  separate `eval_data_iter` — would need a small addition before relying
-  on it for the real run).
+- (Fixed same day, no longer open: held-out eval is now wired into
+  `train.main()` via `build_data_iterators`/`eval_fraction`.)
+
+## Implementation status — `self-embedding` branch (2026-09-15)
+
+Branched from `main` at commit `0a64ba5` specifically to implement v2
+(`PROMPTS/soft_prompt_generator_spec_v2_self_embedding.md`) as a real,
+registered generator front-end. `main` itself still has no variant
+chosen — this work exists only on this branch until/unless merged.
+
+- `edgealign/generators/self_embedding.py`'s `SelfEmbeddingGenerator`:
+  reads the frozen LLM's own hidden states at layers `L-3, L-2, L-1`
+  (`L` = `num_hidden_layers`, from the loaded model's real config, never
+  hand-specified), concatenates them per token position, mean-pools
+  across positions (attention-mask aware), 3-hidden-layer MLP
+  (256/256/128, GELU) → `N * embedding_dim` output. Raises immediately
+  if the frozen model has fewer than 4 transformer layers (below that,
+  index `L-3` would hit the pre-transformer embedding output, not a real
+  transformer layer — the spec's indexing silently stops making sense).
+- **Shared-infrastructure extension required and made**: v2 needs the
+  frozen LLM's hidden states as input, which only exist after a forward
+  pass through it — unlike v1/v3, which take raw text and are fully
+  self-contained. This was anticipated by
+  `soft_prompt_generator_infrastructure_spec.md` section 3 but not fully
+  specified. Added: `GeneratorFrontend.needs_frozen_hidden_states` flag
+  and two new optional `forward()` args (`hidden_states`,
+  `attention_mask`) in `generators/base.py`;
+  `FrozenLLMHarness.teacher_pass` gained an `output_hidden_states` flag
+  (returns `(logits, hidden_states)` when True, else just `logits` as
+  before); `train.py`'s `training_step`/`build_generator` and
+  `evaluate.py`'s `evaluate` branch on that flag. All of this is a no-op
+  for generators that don't set the flag — confirmed by re-running the
+  pre-existing stub smoke test unmodified after the change (still
+  passes).
+- `train.py`'s `build_generator` now also accepts the frozen model's HF
+  config and auto-fills `hidden_size`/`num_hidden_layers` for any
+  generator that needs them, rather than trusting a YAML-specified value
+  that could drift out of sync with whichever checkpoint is actually
+  loaded.
+- `configs/prototype_32b.yaml` on this branch: `generator.type:
+  "self_embedding"`.
+
+**Verified locally** (same conda env `edgealign`, CPU-only, no GPU):
+`scripts/run_smoke_test_self_embedding.py` — a tiny 4-layer random
+`Qwen3ForCausalLM` (deeper than the baseline smoke test's 2 layers,
+specifically to exercise real `L-3..L-1` indexing), synthetic prompts,
+real `run_training`/`training_step`. Passed: finite non-negative loss,
+frozen params unchanged, generator params updated, selected layer
+indices confirmed `[1, 2, 3]` for `L=4` (excludes index 0 embedding
+output and index 4 final layer, as intended). Also unit-verified
+`build_generator`'s auto-fill logic directly against a mock 32B-shaped
+config (`hidden_size=5120, num_hidden_layers=64` → indices `[61,62,63]`)
+and the shallow-model guard (raises for `num_hidden_layers=3`).
+
+**Not yet done**: never run against the real Qwen 3 32B or real data —
+cluster-only, not this dev machine. v1/v3 remain unimplemented.
 
 ## Git structure
 

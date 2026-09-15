@@ -4,6 +4,14 @@
 
 # EdgeAlign
 
+> **Branch: `self-embedding`.** This branch implements the v2
+> self-embedding generator variant
+> (`PROMPTS/soft_prompt_generator_spec_v2_self_embedding.md`) as the
+> concrete generator front-end, on top of the shared infrastructure. See
+> "v2 self-embedding implementation" below for what's implemented,
+> verified, and still open. `main` has the shared infrastructure with no
+> variant chosen yet.
+
 EdgeAlign is a research project for a **soft prompt generator**: a small
 trainable network that compresses a prompt (and optional context) into a
 short sequence of "soft prompt" prefix vectors, prepended to the token
@@ -40,19 +48,63 @@ fine-tuning the LLM itself.
 - **v1 — Baseline (separate encoder)** — a frozen BERT-family encoder reads
   the prompt/context, feeding a 3-layer MLP (128 units, GELU) that outputs
   the soft prompt vectors.
-- **v2 — Self-embedding generator** — no separate encoder; reuses the
-  frozen LLM's own hidden states (last three transformer layers before the
-  final layer, concatenated and mean-pooled) as the generator's input. Costs
-  two forward passes through the frozen LLM per example, in exchange for
+- **v2 — Self-embedding generator** *(implemented on this branch — see
+  below)* — no separate encoder; reuses the frozen LLM's own hidden
+  states (last three transformer layers before the final layer,
+  concatenated and mean-pooled) as the generator's input. Costs two
+  forward passes through the frozen LLM per example, in exchange for
   richer representations.
 - **v3 — Linear attention / SSM encoder** — replaces the BERT-family
   encoder with a frozen linear-attention or state-space model encoder (e.g.
   Mamba), to remove the short fixed-context-length ceiling that
   full-attention encoders impose.
 
-No variant has been chosen for implementation yet — see `PROMPTS/` for the
-full specs, and `MEMORY.md` for a detailed summary and current project
-state.
+v1 and v3 are not implemented anywhere yet — see `PROMPTS/` for the full
+specs, and `MEMORY.md` for a detailed summary and current project state.
+
+## v2 self-embedding implementation (this branch)
+
+`edgealign/generators/self_embedding.py`'s `SelfEmbeddingGenerator`
+implements the spec directly:
+
+- No separate encoder module. It reads the frozen LLM's own hidden
+  states from layers `L-3, L-2, L-1` (`L` = `num_hidden_layers`),
+  concatenates them per token position (not averaged), mean-pools across
+  positions (respecting the attention mask), then runs a 3-hidden-layer
+  MLP (256/256/128, GELU) into the `N * embedding_dim` output.
+- `hidden_size`/`num_hidden_layers` are never hand-configured — they're
+  pulled automatically from whichever frozen model is actually loaded
+  (`edgealign/train.py`'s `build_generator`), so they can't silently
+  drift out of sync with the real checkpoint.
+- This variant needs the frozen LLM's hidden states as input, which only
+  exist after a forward pass through it — unlike v1/v3, which are
+  self-contained. To support that without baking v2's specifics into the
+  shared training loop, `GeneratorFrontend` (in
+  `edgealign/generators/base.py`) gained a `needs_frozen_hidden_states`
+  flag and two new optional `forward()` arguments
+  (`hidden_states`, `attention_mask`); `FrozenLLMHarness.teacher_pass`
+  gained an `output_hidden_states` flag. Both are no-ops for any
+  front-end that doesn't opt in (the existing stub is unaffected). This
+  was anticipated by the infrastructure spec's own section 3, not scope
+  creep.
+- Guards against a real footgun: sampling "layers `L-3..L-1`" only makes
+  sense when `L >= 4` (otherwise index `L-3` would land on index 0 — the
+  pre-transformer embedding output, not a transformer layer). The
+  constructor raises immediately if a too-shallow model is passed in.
+
+**Verified locally** (no GPU, no downloads): `configs/prototype_32b.yaml`
+now sets `generator.type: "self_embedding"` and parses correctly.
+`scripts/run_smoke_test_self_embedding.py` runs the real training loop
+against a tiny 4-layer random `Qwen3ForCausalLM` and synthetic prompts —
+passes, confirms the frozen model's parameters stay unchanged while the
+generator's do, and confirms the hidden-state layer indices selected
+(`[L-3, L-2, L-1]`) exclude both the embedding output and the final
+layer as intended. The pre-existing stub smoke test (`run_smoke_test.py`)
+still passes unmodified, confirming the interface extension didn't
+regress the non-hidden-state path.
+
+**Not yet done**: never run against the real Qwen 3 32B or real data —
+that's the cluster's job, not this dev machine's.
 
 ## Training data (pretraining stage)
 
@@ -70,16 +122,18 @@ coverage), **OpenCodeInstruct** (paired instruction-and-code prompts), and
   scheme, dataset loaders) per
   `PROMPTS/soft_prompt_generator_infrastructure_spec.md`. The generator
   front-end (v1/v2/v3) is a pluggable interface
-  (`edgealign/generators/base.py`) — no variant is implemented yet;
+  (`edgealign/generators/base.py`); `edgealign/generators/self_embedding.py`
+  is the real v2 implementation (this branch);
   `edgealign/generators/stub.py` is a smoke-test-only placeholder, not a
   real variant.
 - `configs/prototype_32b.yaml` — the real config for the training
-  cluster (Qwen 3 32B, real datasets) — do not run it on a laptop.
-  `scripts/run_smoke_test.py` builds its own tiny, config-free setup and
-  runs entirely locally on CPU with no downloads.
-- `scripts/run_smoke_test.py` — runs the real training loop against a
-  tiny random Qwen3-architecture model and synthetic prompts, to verify
-  the plumbing without any GPU, download, or dataset access.
+  cluster (Qwen 3 32B, real datasets, `generator.type: "self_embedding"`
+  on this branch) — do not run it on a laptop.
+- `scripts/run_smoke_test.py` / `scripts/run_smoke_test_self_embedding.py`
+  — run the real training loop against a tiny random Qwen3-architecture
+  model and synthetic prompts (the latter with 4 layers, needed for v2's
+  layer indexing), to verify the plumbing without any GPU, download, or
+  dataset access. Both build their own tiny, config-free setup.
 - `scripts/prepare_stack_edu.py` — offline dataset prep for Stack-Edu
   (resolves file content from the Software Heritage S3 mirror). Run this
   once **on the cluster**, never locally — see spec section 6.1.
@@ -94,7 +148,8 @@ Local (no GPU, no downloads, verifies plumbing only):
 conda create -n edgealign python=3.11
 conda activate edgealign
 pip install -r requirements.txt
-python scripts/run_smoke_test.py
+python scripts/run_smoke_test.py                    # stub front-end
+python scripts/run_smoke_test_self_embedding.py      # v2 front-end
 ```
 
 On the training cluster (real Qwen 3 32B, real data, A100s):
@@ -110,6 +165,4 @@ python -m edgealign.train --config configs/prototype_32b.yaml
 `device_map: "auto"` in `configs/prototype_32b.yaml` shards the 32B
 frozen model across all GPUs visible on the node (via `accelerate`) — no
 manual multi-GPU/model-parallel code is needed for this "frozen giant
-model + tiny trainable generator" shape. No variant (v1/v2/v3) is
-selected yet, so `generator.type` is still the smoke-test stub; swap it
-for a real registered variant before running for real.
+model + tiny trainable generator" shape.

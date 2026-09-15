@@ -3,12 +3,21 @@
 This module boundary is the ONLY thing that differs between v1 (separate
 BERT encoder), v2 (self-embedding, taps the frozen LLM's own hidden
 states), and v3 (linear attention / Mamba encoder) -- see PROMPTS/ for
-each variant's spec. No variant has been chosen for implementation yet.
-The training loop, injection mechanism, and evaluation code in this
-package depend only on this interface, never on a specific variant's
-internals.
+each variant's spec. The training loop, injection mechanism, and
+evaluation code in this package depend only on this interface, never on
+a specific variant's internals.
+
+v1/v3-style variants are fully self-contained: they take raw text and do
+their own tokenization/encoding, with no dependency on the frozen main
+LLM. v2 (self-embedding) is different by design -- it has no separate
+encoder and instead needs the frozen LLM's own hidden states as its
+input, which only exist after a forward pass through that LLM. The
+`needs_frozen_hidden_states` flag and the extra `hidden_states`/
+`attention_mask` forward() arguments below exist ONLY to support that
+case; a front-end that doesn't set the flag never receives them and can
+ignore both.
 """
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -29,8 +38,26 @@ class GeneratorFrontend(nn.Module):
     n_soft_tokens: int
     embedding_dim: int
 
-    def forward(self, prompts: List[str], contexts: Optional[List[str]] = None) -> torch.Tensor:
-        """Returns a (batch, n_soft_tokens, embedding_dim) tensor."""
+    # Set True by a variant (only v2 today) that needs the frozen main
+    # LLM's own hidden states as input. When True, the training loop
+    # runs the teacher pass with output_hidden_states=True and passes the
+    # result through to forward() below instead of relying on prompts
+    # alone.
+    needs_frozen_hidden_states: bool = False
+
+    def forward(
+        self,
+        prompts: List[str],
+        contexts: Optional[List[str]] = None,
+        hidden_states: Optional[Sequence[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Returns a (batch, n_soft_tokens, embedding_dim) tensor.
+
+        hidden_states/attention_mask are only ever populated when
+        needs_frozen_hidden_states is True (see above) -- variants that
+        don't set that flag can ignore both parameters entirely.
+        """
         raise NotImplementedError
 
     def output_layer_for_init(self) -> nn.Linear:

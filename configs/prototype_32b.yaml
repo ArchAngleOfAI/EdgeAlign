@@ -2,9 +2,13 @@
 # Do not run this on a local dev machine: it downloads/loads the full
 # Qwen 3 32B checkpoint and the real training corpora.
 #
-# generator.type is still "dummy_stub" -- no v1/v2/v3 variant has been
-# chosen for implementation yet. Replace it once one is registered in
-# edgealign/train.py's GENERATOR_REGISTRY.
+# This branch (self-embedding) implements v2:
+# PROMPTS/soft_prompt_generator_spec_v2_self_embedding.md.
+# generator.type = "self_embedding" -- hidden_size/num_hidden_layers are
+# NOT set here; edgealign/train.py's build_generator() fills them in
+# automatically from the loaded Qwen 3 32B checkpoint's own config, so
+# they can never drift out of sync with whichever model is actually
+# loaded.
 
 model:
   name_or_path: "Qwen/Qwen3-32B"
@@ -13,7 +17,7 @@ model:
   trust_remote_code: false
 
 generator:
-  type: "dummy_stub"
+  type: "self_embedding"
   n_soft_tokens: 16
   extra: {}
 

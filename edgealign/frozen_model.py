@@ -62,11 +62,30 @@ class FrozenLLMHarness:
     def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings()(input_ids)
 
-    def teacher_pass(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def teacher_pass(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        output_hidden_states: bool = False,
+    ):
         """Plain prompt, no soft prefix. No gradient -- this branch never
-        needs one, teacher logits are a fixed target."""
+        needs one, teacher logits are a fixed target.
+
+        Returns just the logits by default. When output_hidden_states is
+        True (needed by hidden-state-based generator front-ends such as
+        v2), returns (logits, hidden_states) instead, where hidden_states
+        is the tuple HF returns: index 0 is the embedding layer's output,
+        index i (1 <= i <= num_hidden_layers) is transformer layer i's
+        output.
+        """
         with torch.no_grad():
-            out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            out = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=output_hidden_states,
+            )
+        if output_hidden_states:
+            return out.logits, out.hidden_states
         return out.logits
 
     def student_pass(

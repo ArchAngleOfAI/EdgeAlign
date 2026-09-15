@@ -19,21 +19,32 @@ from .data.synthetic import synthetic_batches
 from .evaluate import evaluate
 from .frozen_model import FrozenLLMHarness
 from .generators.base import GeneratorFrontend
+from .generators.self_embedding import SelfEmbeddingGenerator
 from .generators.stub import MeanPoolStubGenerator
 from .init_utils import compute_embedding_scale_stats, rescale_output_layer_to_target_stats
 from .losses import embedding_scale_aux_loss, kl_distillation_loss
 
-# No v1/v2/v3 variant has been chosen yet -- "dummy_stub" is a
-# smoke-test-only placeholder (see generators/stub.py). Register real
-# variants here once one is implemented.
+# "dummy_stub" is a smoke-test-only placeholder (see generators/stub.py),
+# not a real variant. "self_embedding" is v2. v1/v3 are not implemented
+# yet.
 GENERATOR_REGISTRY = {
     "dummy_stub": MeanPoolStubGenerator,
+    "self_embedding": SelfEmbeddingGenerator,
 }
 
 
-def build_generator(cfg: GeneratorConfig, embedding_dim: int) -> GeneratorFrontend:
+def build_generator(cfg: GeneratorConfig, embedding_dim: int, frozen_model_config=None) -> GeneratorFrontend:
     cls = GENERATOR_REGISTRY[cfg.type]
-    return cls(n_soft_tokens=cfg.n_soft_tokens, embedding_dim=embedding_dim, **cfg.extra)
+    kwargs = dict(cfg.extra)
+    if getattr(cls, "needs_frozen_hidden_states", False) and frozen_model_config is not None:
+        # hidden_size/num_hidden_layers are properties of the frozen model
+        # actually being loaded, not free hyperparameters -- default to
+        # its real config rather than risking a config-file typo that
+        # silently mismatches the loaded checkpoint. cfg.extra can still
+        # override explicitly if ever needed.
+        kwargs.setdefault("hidden_size", frozen_model_config.hidden_size)
+        kwargs.setdefault("num_hidden_layers", frozen_model_config.num_hidden_layers)
+    return cls(n_soft_tokens=cfg.n_soft_tokens, embedding_dim=embedding_dim, **kwargs)
 
 
 def _batches_from_rows(rows, batch_size: int, max_batches: Optional[int] = None) -> List[List[str]]:
@@ -105,9 +116,14 @@ def training_step(
     input_ids = tokenized["input_ids"].to(device)
     attention_mask = tokenized["attention_mask"].to(device)
 
-    teacher_logits = frozen_llm.teacher_pass(input_ids, attention_mask)
+    needs_hidden_states = getattr(generator, "needs_frozen_hidden_states", False)
+    if needs_hidden_states:
+        teacher_logits, hidden_states = frozen_llm.teacher_pass(input_ids, attention_mask, output_hidden_states=True)
+        soft_prefix = generator(prompts, hidden_states=hidden_states, attention_mask=attention_mask)
+    else:
+        teacher_logits = frozen_llm.teacher_pass(input_ids, attention_mask)
+        soft_prefix = generator(prompts)
 
-    soft_prefix = generator(prompts)
     student_logits = frozen_llm.student_pass(input_ids, attention_mask, soft_prefix)
 
     loss = kl_distillation_loss(teacher_logits, student_logits, generator.n_soft_tokens, attention_mask)
@@ -166,7 +182,7 @@ def main() -> None:
     frozen_llm = FrozenLLMHarness.from_pretrained(cfg.model)
     embedding_stats = compute_embedding_scale_stats(frozen_llm)
 
-    generator = build_generator(cfg.generator, frozen_llm.embedding_dim)
+    generator = build_generator(cfg.generator, frozen_llm.embedding_dim, frozen_llm.model.config)
     rescale_output_layer_to_target_stats(
         generator.output_layer_for_init(), embedding_stats["mean"], embedding_stats["std"]
     )

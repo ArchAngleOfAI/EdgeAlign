@@ -29,8 +29,15 @@ def evaluate(
         input_ids = tokenized["input_ids"].to(device)
         attention_mask = tokenized["attention_mask"].to(device)
 
-        teacher_logits = frozen_llm.teacher_pass(input_ids, attention_mask)
-        soft_prefix = generator(prompts)
+        if getattr(generator, "needs_frozen_hidden_states", False):
+            teacher_logits, hidden_states = frozen_llm.teacher_pass(
+                input_ids, attention_mask, output_hidden_states=True
+            )
+            soft_prefix = generator(prompts, hidden_states=hidden_states, attention_mask=attention_mask)
+        else:
+            teacher_logits = frozen_llm.teacher_pass(input_ids, attention_mask)
+            soft_prefix = generator(prompts)
+
         student_logits = frozen_llm.student_pass(input_ids, attention_mask, soft_prefix)
 
         kl = kl_distillation_loss(teacher_logits, student_logits, generator.n_soft_tokens, attention_mask)
