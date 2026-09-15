@@ -48,6 +48,11 @@ when old entries become outdated.
 - Follow standard git safety practice: check `git status`/`git diff` before
   any destructive operation, never force-push or rewrite history without
   explicit approval.
+- When the user wants pending changes committed and pushed, use the
+  `/push-changes` skill (`.claude/skills/push-changes/SKILL.md`) — it
+  groups the diff into a reasonable number of logical commits, handles
+  pre-commit hook failures by fixing root causes (never bypassing them),
+  and pushes. It deliberately never sets up or touches CI/CD pipelines.
 
 ## Reporting implementation work
 
