@@ -18,6 +18,23 @@ hardware) yet — that is a separate, later port, not covered by this spec.
 Priority here is fast iteration and a clean validation of the method, not
 compute or memory efficiency.
 
+**Implementation note (2026-09-15)**: the real 32B checkpoint has an
+unresolved bf16 numerical bug (its own plain frozen-forward-pass
+produces NaN/zero degeneration on this cluster's hardware/software —
+see MEMORY.md "Real-weights smoke test — Qwen 3 32B, and a real bf16
+bug found"). Prototyping is currently happening directly against **Qwen
+3 8B** instead (unquantized, same A100 cluster, still server hardware —
+this is *not* the 8B-quantized-on-laptop deployment phase this spec
+explicitly scopes out above). This is a practical substitution within
+this same prototype-phase infrastructure, not a redefinition of it: the
+harness, injection mechanism, training loop, and init scheme below are
+unchanged and already model-size-agnostic (hidden_size/num_hidden_layers
+are read from whichever checkpoint is actually loaded, never
+hand-specified). Switch back to the real 32B once the bug is fixed and
+re-verified — see MEMORY.md for current status and
+`configs/qwen3_8b.yaml` / `configs/prototype_32b.yaml` for the two
+configs kept ready for each.
+
 ## 1. Frozen base model harness
 
 - Load Qwen 3, 32B dense variant, in frozen (`no_grad` / parameters not

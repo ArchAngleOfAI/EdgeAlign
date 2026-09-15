@@ -18,6 +18,13 @@ hidden states and feeds them into the generator network.
 ## Frozen base model
 
 - Qwen 3, 32B for prototyping, Qwen 3, 8B for deployment
+- **Implementation note (2026-09-15)**: prototyping on this branch is
+  currently happening directly against Qwen 3 8B instead of 32B, because
+  the 32B checkpoint has an unresolved bf16 numerical bug (its own plain
+  forward pass degenerates, unrelated to this generator). This is a
+  practical stopgap, not a change to the deployment-phase target above —
+  see MEMORY.md's "Working target switched to Qwen 3 8B for now" for
+  full detail and current status.
 - Weights are never updated at any stage of this pipeline
 - The frozen model is used both as the source of hidden state embeddings
   and, after prefix injection, as the model being conditioned

@@ -1,6 +1,12 @@
 # Real prototype-phase training config -- meant for the A100 GPU cluster.
-# Do not run this on a local dev machine: it downloads/loads the full
-# Qwen 3 32B checkpoint and the real training corpora.
+# Do not run this on a local dev machine: it loads the full Qwen 3 32B
+# checkpoint and the real training corpora.
+#
+# WARNING (2026-09-15): this checkpoint has an unresolved real bf16
+# numerical bug -- see MEMORY.md "Real-weights smoke test -- Qwen 3
+# 32B, and a real bf16 bug found". Do not use this config for a real
+# training run until that's fixed and re-verified. configs/qwen3_8b.yaml
+# is the working stopgap in the meantime.
 #
 # This branch (self-embedding) implements v2:
 # PROMPTS/soft_prompt_generator_spec_v2_self_embedding.md.
@@ -11,7 +17,10 @@
 # loaded.
 
 model:
-  name_or_path: "Qwen/Qwen3-32B"
+  # Local cached copy on the training cluster (avoids a ~64GB download
+  # from the HF Hub id "Qwen/Qwen3-32B") -- see MEMORY.md "Real-weights
+  # smoke test" for how this path was found.
+  name_or_path: "/data/models/huggingface/qwen3-32b"
   dtype: "bfloat16"
   device_map: "auto"   # shards the model across all visible A100s on the node
   trust_remote_code: false

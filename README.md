@@ -11,6 +11,15 @@
 > "v2 self-embedding implementation" below for what's implemented,
 > verified, and still open. `main` has the shared infrastructure with no
 > variant chosen yet.
+>
+> **Currently prototyping directly on Qwen 3 8B, not the originally
+> intended 32B.** The 32B checkpoint has an unresolved bf16 numerical
+> bug (unrelated to this generator — its own plain forward pass
+> degenerates); 8B is fully verified working (forward path + full
+> training-loop smoke test, real weights, real cluster). See
+> `MEMORY.md`'s "Working target switched to Qwen 3 8B for now" for full
+> detail. Use `configs/qwen3_8b.yaml`, not `configs/prototype_32b.yaml`,
+> until that's resolved.
 
 EdgeAlign is a research project for a **soft prompt generator**: a small
 trainable network that compresses a prompt (and optional context) into a
@@ -126,17 +135,30 @@ coverage), **OpenCodeInstruct** (paired instruction-and-code prompts), and
   is the real v2 implementation (this branch);
   `edgealign/generators/stub.py` is a smoke-test-only placeholder, not a
   real variant.
-- `configs/prototype_32b.yaml` — the real config for the training
-  cluster (Qwen 3 32B, real datasets, `generator.type: "self_embedding"`
-  on this branch) — do not run it on a laptop.
+- `configs/qwen3_8b.yaml` — **the config currently in use.** Real Qwen 3
+  8B (unquantized, on the cluster), Wikipedia data mode,
+  `generator.type: "self_embedding"`. Do not run on a laptop.
+- `configs/prototype_32b.yaml` — the originally-intended config (real
+  Qwen 3 32B). **Blocked**: this checkpoint has an unresolved bf16
+  numerical bug (see `MEMORY.md`) — do not use for a real run until
+  that's fixed and re-verified. Kept ready for when it is.
 - `scripts/run_smoke_test.py` / `scripts/run_smoke_test_self_embedding.py`
-  — run the real training loop against a tiny random Qwen3-architecture
-  model and synthetic prompts (the latter with 4 layers, needed for v2's
-  layer indexing), to verify the plumbing without any GPU, download, or
-  dataset access. Both build their own tiny, config-free setup.
+  / `scripts/run_smoke_test_wikipedia_packing.py` — run the real training
+  loop against a tiny random Qwen3-architecture model (or a synthetic
+  Wikipedia-shaped tar for the last one) to verify the plumbing without
+  any GPU, download, or dataset access. All build their own tiny,
+  config-free setup.
+- `scripts/run_smoke_test_qwen3_8b_real.py` /
+  `scripts/run_smoke_test_qwen3_32b_real.py` — load the REAL pretrained
+  weights (cluster-only, real GPUs required) and run a few real training
+  steps end-to-end. The 8B one is verified passing; the 32B one is
+  expected to fail until the bf16 bug is fixed.
+- `scripts/check_wikipedia_on_cluster.py` — real-data sanity check for
+  the Wikipedia tar loader, cluster-only.
 - `scripts/prepare_stack_edu.py` — offline dataset prep for Stack-Edu
-  (resolves file content from the Software Heritage S3 mirror). Run this
-  once **on the cluster**, never locally — see spec section 6.1.
+  (resolves file content from the Software Heritage S3 mirror). Not
+  currently used (see "Currently prototyping" note above) — kept ready
+  for when the real code/tool-use data mix is pursued.
 - `MEMORY.md` / `SHORT_MEMORY.md` / `AGENT.md` — the project's persistent
   memory and agent operating instructions (see those files for details).
 
@@ -150,19 +172,22 @@ conda activate edgealign
 pip install -r requirements.txt
 python scripts/run_smoke_test.py                    # stub front-end
 python scripts/run_smoke_test_self_embedding.py      # v2 front-end
+python scripts/run_smoke_test_wikipedia_packing.py   # wikipedia data mode
 ```
 
-On the training cluster (real Qwen 3 32B, real data, A100s):
+On the training cluster (real Qwen 3 8B, real Wikipedia data, A100s —
+**this is the current working target**, see the banner at the top):
 
 ```bash
-# once, before training:
-python scripts/prepare_stack_edu.py --output-dir /data/stack_edu_prepared
+# quick real-weights smoke test first:
+python scripts/run_smoke_test_qwen3_8b_real.py
 
 # training:
-python -m edgealign.train --config configs/prototype_32b.yaml
+python -m edgealign.train --config configs/qwen3_8b.yaml
 ```
 
-`device_map: "auto"` in `configs/prototype_32b.yaml` shards the 32B
-frozen model across all GPUs visible on the node (via `accelerate`) — no
-manual multi-GPU/model-parallel code is needed for this "frozen giant
-model + tiny trainable generator" shape.
+`device_map: "auto"` shards the frozen model across all GPUs visible on
+the node (via `accelerate`) — no manual multi-GPU/model-parallel code is
+needed for this "frozen giant model + tiny trainable generator" shape.
+On a shared cluster, check `nvidia-smi` first and restrict to free GPUs
+via `CUDA_VISIBLE_DEVICES` rather than assuming the whole node is yours.

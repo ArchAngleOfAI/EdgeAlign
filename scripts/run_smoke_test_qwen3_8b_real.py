@@ -1,22 +1,22 @@
-"""Real-weights smoke test against the actual Qwen 3 32B checkpoint
-cached on the training cluster.
+"""Real-weights smoke test against the Qwen 3 8B checkpoint cached on
+the training cluster.
 
-Unlike the other smoke tests (tiny random models, run anywhere -- see
-run_smoke_test.py / run_smoke_test_self_embedding.py), this loads the
-REAL 32B pretrained weights via FrozenLLMHarness.from_pretrained and
-must run on a machine with real GPUs and access to the checkpoint --
-never locally. Uses the v2 self-embedding generator with
-hidden_size/num_hidden_layers auto-derived from the loaded model's own
-real config (edgealign/train.py's build_generator), not hand-specified.
+Temporary stopgap default (see MEMORY.md "Working target switched to
+Qwen 3 8B for now"): the 32B checkpoint has an unresolved real bf16
+numerical bug (scripts/run_smoke_test_qwen3_32b_real.py, kept for
+re-testing once that's fixed), while 8B's forward path checked out
+clean. Same pattern otherwise -- loads REAL pretrained weights via
+FrozenLLMHarness.from_pretrained and must run on a machine with real
+GPUs and access to the checkpoint, never locally. Uses the v2
+self-embedding generator with hidden_size/num_hidden_layers
+auto-derived from the loaded model's own real config.
 
 Everything else is kept minimal (batch size 1, short sequences, a
-handful of steps) -- the point is catching integration issues against
-the real checkpoint's real dimensions and real device placement
-(device_map="auto" shards it across whichever GPUs are visible), not
+handful of steps) -- the point is catching integration issues, not
 producing a useful checkpoint or benchmarking anything.
 
 Usage (on the cluster, restricting to known-free GPUs):
-    CUDA_VISIBLE_DEVICES=1,3,4,5,6 python scripts/run_smoke_test_qwen3_32b_real.py [model_path]
+    CUDA_VISIBLE_DEVICES=4 python scripts/run_smoke_test_qwen3_8b_real.py [model_path]
 """
 import sys
 from pathlib import Path
@@ -31,14 +31,14 @@ from edgealign.frozen_model import FrozenLLMHarness
 from edgealign.init_utils import compute_embedding_scale_stats, rescale_output_layer_to_target_stats
 from edgealign.train import build_generator, run_training
 
-DEFAULT_MODEL_PATH = "/data/models/huggingface/qwen3-32b"
+DEFAULT_MODEL_PATH = "/data/models/huggingface/qwen3-8b"
 
 
 def main() -> None:
     model_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MODEL_PATH
     torch.manual_seed(0)
 
-    print(f"Loading real Qwen3-32B from {model_path} (bfloat16, device_map=auto)...")
+    print(f"Loading real Qwen3-8B from {model_path} (bfloat16, device_map=auto)...")
     model_cfg = ModelConfig(name_or_path=model_path, dtype="bfloat16", device_map="auto")
     frozen_llm = FrozenLLMHarness.from_pretrained(model_cfg)
 
@@ -60,14 +60,14 @@ def main() -> None:
     )
 
     # NOTE: 0.01 (borrowed from the tiny-toy-model smoke tests) caused
-    # catastrophic first-step divergence on the 8B checkpoint (KL
-    # exploded to ~268,000 after one step, "finite" so it slipped past
-    # the old assertion). 0.0001 matches the real training config and
-    # was verified stable there. See MEMORY.md "Learning rate too
-    # aggressive" note.
+    # catastrophic first-step divergence here -- KL exploded to ~268,000
+    # after one step even though it stayed "finite" (so the old
+    # finite-only assertion below missed it). 0.0001 matches the real
+    # training config and is stable -- verified directly before fixing
+    # this default. See MEMORY.md "Learning rate too aggressive" note.
     train_cfg = TrainConfig(
         learning_rate=0.0001, max_steps=5, eval_every=0, aux_loss_weight=0.01,
-        log_every=1, seed=0, output_dir="/tmp/edgealign_smoke_test_qwen32b_real",
+        log_every=1, seed=0, output_dir="/tmp/edgealign_smoke_test_qwen8b_real",
     )
     data_iter = synthetic_batches(batch_size=1, num_batches=train_cfg.max_steps, seed=0)
 
@@ -83,19 +83,20 @@ def main() -> None:
 
     assert len(history) == train_cfg.max_steps, f"expected {train_cfg.max_steps} steps, got {len(history)}"
     assert all(torch.isfinite(torch.tensor(v)) for v in history), f"non-finite loss: {history}"
-    # "Finite" alone isn't enough -- see the note above the TrainConfig
-    # for why. A real KL divergence for this vocab size is bounded by
-    # log(vocab_size)~=11.9 in a healthy regime; 20 leaves slack for
-    # early noisy steps while still catching that class of blowup.
+    # "Finite" alone isn't enough -- a bad learning rate once produced a
+    # perfectly finite but wildly unstable trajectory here (loss hit
+    # ~268,000 after one step). A real KL divergence for this vocab size
+    # is bounded by log(vocab_size)~=11.9 in a healthy regime; 20 leaves
+    # slack for early noisy steps while still catching that class of blowup.
     assert max(history) < 20, f"loss exceeded sane bound, likely unstable: {history}"
     assert torch.equal(frozen_param_before, frozen_param_after), (
-        "frozen Qwen3-32B parameters changed during training -- must never happen!"
+        "frozen Qwen3-8B parameters changed during training -- must never happen!"
     )
     assert not torch.equal(generator_param_before, generator_param_after), (
         "generator parameters did not change -- training step is not updating the generator!"
     )
 
-    print("\nSMOKE TEST PASSED (real Qwen 3 32B weights, self-embedding generator)")
+    print("\nSMOKE TEST PASSED (real Qwen 3 8B weights, self-embedding generator)")
     print(f"loss trajectory: {[round(v, 4) for v in history]}")
 
 

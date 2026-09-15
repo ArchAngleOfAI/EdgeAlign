@@ -4,6 +4,21 @@ Durable knowledge about the project. Update by editing in place when facts
 change; don't just append. See AGENT.md for how the agent should behave,
 and SHORT_MEMORY.md for current in-flight work.
 
+> **Current status (2026-09-15): prototyping is happening directly on
+> Qwen 3 8B, not the originally-intended 32B.** The 32B checkpoint has
+> an unresolved real bf16 numerical bug (frozen model's own forward pass
+> produces NaN/zero degeneration — see "Real-weights smoke test — Qwen 3
+> 32B" below); 8B's forward path and a full training-loop smoke test
+> both check out clean. This is a practical substitution within Phase 1
+> (prototype), not a move to Phase 2 (which means 8B *quantized* on
+> laptop hardware — this is plain 8B on the same A100 cluster). See
+> "Working target switched to Qwen 3 8B for now" below for full detail.
+> Everywhere below that says "32B" is prototype-phase, historical
+> context from before this switch, or refers to `configs/prototype_32b.yaml`
+> kept ready for when the bug is fixed — read current instructions
+> (`configs/qwen3_8b.yaml`, `scripts/run_smoke_test_qwen3_8b_real.py`)
+> as the actual working target for now.
+
 ## Project goal
 
 EdgeAlign is building a **soft prompt generator**: a small trainable network
@@ -33,7 +48,13 @@ ever fine-tuning the LLM itself.
 - **Phase 1 — Prototype**: Qwen 3 32B dense, frozen, run on server-class
   hardware (A100s). Priority: fast iteration, validate that the method
   works at all (does self-distillation converge, does the later RL loop
-  improve task success). Not the deployment target.
+  improve task success). Not the deployment target. **As of 2026-09-15,
+  actually prototyping directly on Qwen 3 8B instead** (32B blocked on
+  an unresolved bf16 bug — see the banner at the top of this file and
+  "Working target switched to Qwen 3 8B for now" below). Still Phase 1
+  in spirit (fast iteration, method validation), just a smaller model
+  than originally specced, and still unquantized/server-hardware unlike
+  Phase 2 below.
 - **Phase 2 — Deploy**: Qwen 3 8B dense, frozen, quantized, run on a real
   customer laptop (e.g. MacBook Air class, 16GB+ unified memory). Priority:
   memory footprint and inference speed, in addition to correctness.
@@ -475,23 +496,67 @@ rather than just lowering the learning rate:
    on this transformers version — not a bug in our injection/generator
    code, not a device-sharding artifact, not fixed by switching
    attention backends.**
-4. Leading hypothesis, not yet tested: the checkpoint's own
-   `config.json` states `"transformers_version": "4.51.0"`; this cluster
-   has `transformers==5.17.0` installed — a major version jump that
-   plausibly introduced a numerics regression for Qwen3 (e.g. a
-   normalization/softmax step that stopped upcasting to fp32
-   internally). Not yet confirmed.
+4. **Hypothesis tested and DISPROVEN**: the checkpoint's own
+   `config.json` states `"transformers_version": "4.51.0"`; this
+   cluster's main venv has `transformers==5.17.0` installed. Built a
+   second, isolated venv (`~/EdgeAlign/.venv_tf451` on the cluster —
+   deliberately kept separate from the working main `.venv` so a failed
+   experiment couldn't cost the already-verified baseline) with
+   `transformers==4.51.0` pinned exactly (pip auto-resolved
+   `accelerate==1.15.0`, compatible `tokenizers`/`datasets`). Confirmed
+   first that nothing else regressed: all three tiny-model smoke tests
+   (stub, self-embedding, wikipedia-packing) still pass unmodified under
+   4.51.0. Then re-ran the real Qwen3-32B bf16 check under 4.51.0 with
+   the default (SDPA) attention backend — **still broken, and actually
+   worse**: NaN starts at layer 6 (vs. layer 10 under 5.17.0), same
+   exact-zero/NaN mixed pattern through the rest of the network, same
+   NaN at the final layer, same zero logits. The transformers version
+   is not the cause.
 
-**Status: paused here, unresolved.** fp32 isn't viable for real training
-(2x memory, ~108GB just for weights, much slower). Options on the table,
-not yet decided: pin `transformers` closer to `4.51.x` and retest in
-bf16 (best guess at the actual fix); try fp16 instead of bf16
-(untested — unclear given residual-stream magnitudes already reaching
-~20+ in fp32, fp16's narrower range could overflow); something else
-(e.g. a known upstream issue). **Do not resume real training on this
+**Status: root cause still open, but narrowed.** Since bf16 is broken
+under both library versions (4.51.0 and 5.17.0) while fp32 is completely
+clean under 5.17.0, this isn't a transformers regression — it's
+something more fundamental about running this specific checkpoint's
+bf16 *compute* (not storage — the checkpoint's weights are natively
+bf16 already, so fp32 loading just losslessly upcasts them; the fp32
+run's cleanliness shows the input values are fine, only the bf16
+*arithmetic* through 64 layers is not) at this depth, on this hardware/
+torch combination. fp32 itself isn't viable for real training (2x
+memory, ~108GB just for weights, much slower). Untested candidates:
+fp16 instead of bf16 (unclear given residual-stream magnitudes already
+reaching ~20+ in fp32 — fp16's much narrower range could overflow
+outright rather than underflow); a different torch version (2.14.0 is
+very new; a CUDA/kernel-level bf16 regression on A100 specific to this
+torch release is untested); comparing against a smaller Qwen3 checkpoint
+in bf16 to see if this is checkpoint-specific or general to the
+architecture at this depth. **Do not resume real training on this
 checkpoint in bf16 until this is actually fixed and re-verified** — the
-smoke test's job (catching exactly this kind of issue before a real run)
-worked as intended.
+smoke test's job (catching exactly this kind of issue before a real
+run) worked as intended.
+
+**Update: tested Qwen 3 8B (`/data/models/huggingface/qwen3-8b`, same
+`Qwen3ForCausalLM`/`qwen3` family, same tokenizer/vocab, 36 layers,
+hidden_size=4096) in bf16, forward path only (no training, per
+instruction) — clean.** Every layer (checked every 3rd, 0 through 36)
+produced finite, smoothly-growing values, no NaN, no zero blocks; final
+logits were not just finite but genuinely sensible (given `"def add(a,
+b):\n    return a + b"`, predicted `"\n\n"` as the next token — exactly
+right). Same transformers 5.17.0, same torch/hardware, same `sdpa`
+attention backend that failed on the 32B. Ran on a single GPU (8B in
+bf16 is ~16GB, fits on one A100; the 32B needed 3-way sharding).
+
+**So this is specific to the 32B checkpoint (or its depth/sharding),
+not a general Qwen3-in-bf16 problem.** Two candidate explanations,
+not yet disambiguated: (a) **depth** — 64 layers vs. 36, and the 32B's
+own fp32 residual-stream norm was already seen growing to ~20+ by layer
+63 vs. the 8B's more modest ~6.4 peak (at layer 33) before dropping to
+0.84 by layer 36 — a deeper network accumulating more bf16 rounding
+error is a plausible, literature-consistent explanation; or (b)
+**multi-GPU sharding** — the 32B test required `device_map="auto"`
+across 3 GPUs, the 8B test used only 1, and this hasn't been cleanly
+separated from the depth explanation since no single GPU here has
+enough memory to hold the 32B alone to test depth in isolation from
+sharding.
 
 **GPU etiquette note**: this cluster is shared and other users run real
 jobs concurrently. Before each run, checked `nvidia-smi` for free GPUs
@@ -503,6 +568,77 @@ earlier attempt using GPU 7 alongside free ones showed a misleading
 cause of the bf16 issue (the same degeneration reproduced identically
 on a clean 3-GPU-only run with no offloading), but avoiding partially-
 occupied GPUs remains the safer default on this box regardless.
+
+## Working target switched to Qwen 3 8B for now (2026-09-15)
+
+**Decision**: since the 32B bf16 bug above is a real, unresolved blocker
+and Qwen 3 8B's forward path checked out clean, everything (configs,
+default scripts) is now pointed at
+`/data/models/huggingface/qwen3-8b` until the 32B issue is actually
+fixed. This is a pragmatic stopgap, not a move to "Phase 2 — Deploy"
+(that phase means an 8B model, *quantized*, on laptop-class hardware —
+this is the plain unquantized 8B on the same A100 cluster, still
+functionally standing in for the Phase 1 prototype target). Don't
+confuse the two when reading old notes above that assume 32B is "the"
+prototype model.
+
+- `configs/qwen3_8b.yaml` — new config, model path pointed at the 8B
+  checkpoint, otherwise mirrors `configs/prototype_32b.yaml` (same
+  generator type, same data sources). Use this one for now.
+- `configs/prototype_32b.yaml` is left as-is (still targets the real
+  32B) — not deleted, so it's ready to use again once the bf16 bug is
+  actually fixed and re-verified.
+- `scripts/run_smoke_test_qwen3_8b_real.py` — new script, same pattern
+  as the 32B one but defaulting to the 8B path.
+  `scripts/run_smoke_test_qwen3_32b_real.py` is kept as-is for
+  re-testing 32B later.
+
+**Full end-to-end verification, not just forward-path**: ran the actual
+training-loop smoke test (`run_smoke_test_qwen3_8b_real.py`) against the
+real 8B weights with the real self-embedding generator. First attempt
+"passed" its assertions (finite loss, frozen params unchanged, generator
+params updated) but the loss trajectory was actually `[0.635, 268271.75,
+2480.09]` — technically finite, but nowhere near a sane KL divergence
+(bounded by ~11.9 nats for this vocab size in a healthy regime). The
+lenient finite-only assertion missed this. Diagnosed rather than just
+reported it as passing:
+- Checked initial calibration directly: soft-prefix norm 2.05 vs. real
+  embedding mean-norm 1.37 (close, not the problem), initial KL 0.38
+  (sane) — so the blowup happened *after* the first optimizer step, not
+  from bad initialization.
+- The smoke test scripts had hardcoded `learning_rate=0.01`, borrowed
+  from the tiny-toy-model smoke tests. Re-ran with `learning_rate=0.0001`
+  (matching the real training config) — loss trajectory:
+  `[0.734, 1.233, 0.540, 0.586, 0.301]`, completely stable. **Root cause:
+  smoke-test learning rate too aggressive for real activations — a
+  smoke-test hyperparameter mismatch, not a fundamental architecture or
+  precision bug.**
+- Fixed both `run_smoke_test_qwen3_8b_real.py` and
+  `run_smoke_test_qwen3_32b_real.py` to use `learning_rate=0.0001`, and
+  added a sanity-bound assertion (`max(history) < 20`) so a finite-but-
+  wildly-unstable trajectory can't silently read as "PASSED" again.
+  Re-ran the fixed 8B smoke test end-to-end: clean pass, loss trajectory
+  `[0.635, 0.150, 0.699, 0.513, 0.425]`.
+
+**Bottom line: Qwen 3 8B is fully verified working** — frozen forward
+path clean, full training-loop smoke test clean with sane loss, real
+weights, real self-embedding generator, on the real cluster. This is
+the actual current working target for prototyping.
+
+**Important caveat for future debugging — read this before blaming the
+generator.** We now have direct, hard-won evidence that the *frozen
+model itself* can silently fail in ways that have nothing to do with
+the generator or training code (the 32B bf16 bug: exact-zero blocks and
+NaN in the frozen model's own plain forward pass, no soft prefix, no
+generator involved at all — see above). **If training or evaluation on
+Qwen 3 8B fails, produces garbage, or fails to converge at some point in
+the future, do not assume it's necessarily the generator's architecture
+or training logic that's at fault.** Check the frozen model's own
+plain-forward-pass health first (the same kind of per-layer NaN/zero
+probe used above) before concluding the self-embedding design doesn't
+work. A generator trained against a frozen model that is itself
+producing degenerate output cannot possibly learn anything meaningful,
+regardless of how correct the generator's own code is.
 
 ## Git structure
 
