@@ -46,6 +46,11 @@ class DataConfig:
     # "synthetic" = small in-code corpus, local smoke testing only.
     # "real" = the actual Stack-Edu/OpenCodeInstruct/xLAM mix (spec
     # section 6), for the training cluster.
+    # "wikipedia" = the packed Wikipedia passage corpus actually used for
+    # the first real-data validation run on the self-embedding branch
+    # (see MEMORY.md "Pretraining data actually used") -- a deliberate,
+    # acknowledged departure from the code/tool-use data this project's
+    # specs otherwise call for; see PROMPTS/soft_prompt_generator_spec_v2_self_embedding.md.
     mode: str = "synthetic"
     max_seq_len: int = 512
     batch_size: int = 4
@@ -55,6 +60,11 @@ class DataConfig:
     # (a small fixed synthetic eval set is used instead when > 0).
     eval_fraction: float = 0.0
     max_eval_batches: int = 20
+    # "wikipedia" mode only: path to the wiki-18.jsonl tar archive (see
+    # edgealign/data/wikipedia.py), and the shuffle buffer size for its
+    # approximate streaming shuffle.
+    wikipedia_tar_path: Optional[str] = None
+    wikipedia_shuffle_buffer_size: int = 10000
 
 
 @dataclass

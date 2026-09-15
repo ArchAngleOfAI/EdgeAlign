@@ -4,3 +4,4 @@ __pycache__/
 checkpoints/
 *.egg-info/
 .pytest_cache/
+.claude/settings.local.json

@@ -14,6 +14,8 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from .config import ExperimentConfig, GeneratorConfig, load_config
+from .data import wikipedia
+from .data.packing import pack_texts
 from .data.pipeline import build_mixed_dataset
 from .data.synthetic import synthetic_batches
 from .evaluate import evaluate
@@ -64,10 +66,50 @@ def _batches_from_rows(rows, batch_size: int, max_batches: Optional[int] = None)
     return batches
 
 
-def build_data_iterators(data_cfg) -> "tuple[Iterable[List[str]], Optional[List[List[str]]]]":
+def build_data_iterators(
+    data_cfg, eos_token: Optional[str] = None
+) -> "tuple[Iterable[List[str]], Optional[List[List[str]]]]":
     """Returns (train_iter, eval_batches). eval_batches is a plain list
     (reusable across multiple evaluate() calls during training) or None
     if no held-out evaluation is configured."""
+    if data_cfg.mode == "wikipedia":
+        if not data_cfg.wikipedia_tar_path:
+            raise ValueError("data.wikipedia_tar_path must be set for mode='wikipedia'")
+
+        # Packing uses the frozen model's real EOS token as the document
+        # separator when available (matching how the frozen model was
+        # almost certainly pretrained on packed documents), falling back
+        # to a plain blank line otherwise.
+        separator = eos_token or "\n\n"
+
+        def _packed_batches(seed: int, max_passages: Optional[int] = None):
+            passages = wikipedia.iter_passages(
+                data_cfg.wikipedia_tar_path,
+                shuffle_buffer_size=data_cfg.wikipedia_shuffle_buffer_size,
+                seed=seed,
+                max_passages=max_passages,
+            )
+            packed = pack_texts(passages, max_seq_len=data_cfg.max_seq_len, separator=separator)
+            batch = []
+            for text in packed:
+                batch.append(text)
+                if len(batch) == data_cfg.batch_size:
+                    yield batch
+                    batch = []
+
+        train_iter = _packed_batches(seed=0)
+        eval_batches = None
+        if data_cfg.eval_fraction > 0:
+            # The corpus is streamed, not a known-length dataset, so
+            # eval_fraction here means "read roughly this many packed
+            # eval batches" (via a passage budget, ~5 passages/pack) from
+            # a different shuffle seed -- not a true held-out split of a
+            # fixed-size dataset like the "real" mode below.
+            passages_budget = data_cfg.max_eval_batches * data_cfg.batch_size * 5
+            eval_batches = list(_packed_batches(seed=1, max_passages=passages_budget))[: data_cfg.max_eval_batches]
+
+        return train_iter, eval_batches
+
     if data_cfg.mode == "synthetic":
         train_iter = synthetic_batches(batch_size=data_cfg.batch_size, num_batches=None, seed=0)
         eval_batches = None
@@ -188,7 +230,7 @@ def main() -> None:
     )
     generator.to(frozen_llm.input_embedding_device)
 
-    data_iter, eval_batches = build_data_iterators(cfg.data)
+    data_iter, eval_batches = build_data_iterators(cfg.data, eos_token=frozen_llm.tokenizer.eos_token)
 
     history = run_training(
         frozen_llm, generator, data_iter, cfg.train, cfg.data.max_seq_len, embedding_stats,

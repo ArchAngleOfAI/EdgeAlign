@@ -99,6 +99,32 @@ hidden states and feeds them into the generator network.
   instruction-and-code prompts, and xLAM for tool-calling prompt shapes,
   mixed in a tunable ratio
 
+**Implementation note (2026-09-15, `self-embedding` branch)**: the actual
+first real-data pretraining run on this branch uses a **Wikipedia
+passage corpus** (a FlashRAG-style `wiki_dpr_100w` dump, ~100-word
+chunks) already available on the training cluster, instead of the
+Stack-Edu/OpenCodeInstruct/xLAM mix specified above. This is a
+deliberate, acknowledged departure from this spec's stated data
+guidance — not a redefinition of it. Reason: the code/tool-use datasets
+this spec calls for either need credentials not yet set up
+(Stack-Edu's AWS/S3 step) or simply weren't pulled yet, while the
+Wikipedia corpus was already sitting on the cluster and let us validate
+the full training loop against real, real-sized data immediately.
+Wikipedia is general encyclopedic text, not code or tool-call shaped —
+exactly the kind of "general multilingual web text" this project's
+specs otherwise say to weight away from. Any warm-start checkpoint
+trained on it should be treated as a pipeline/method validation run,
+not a generator checkpoint expected to generalize well to the real
+coding-and-tool-use deployment target — that still requires the code/
+tool-use mix once it's actually available. See MEMORY.md's
+"Implementation status" for this branch for the full rationale and
+current state.
+
+(A WebShop agent-trajectory corpus was initially considered alongside
+Wikipedia for this validation run, but turned out not to be actually
+readable on the cluster — permissions blocked content access to every
+trajectory file, only filenames were ever visible. Dropped; not used.)
+
 ## Open questions specific to this version
 
 - How exactly to pool across token positions, mean pooling is the simplest
