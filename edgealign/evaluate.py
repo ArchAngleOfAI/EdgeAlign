@@ -16,6 +16,8 @@ def evaluate(
     data_iter: Iterable[List[str]],
     max_seq_len: int,
     max_batches: Optional[int] = None,
+    kl_top_k: Optional[int] = None,
+    kl_chunk_size: Optional[int] = None,
 ) -> float:
     generator.eval()
     total_kl, n_batches = 0.0, 0
@@ -30,8 +32,12 @@ def evaluate(
         attention_mask = tokenized["attention_mask"].to(device)
 
         if getattr(generator, "needs_frozen_hidden_states", False):
-            teacher_logits, hidden_states = frozen_llm.teacher_pass(
-                input_ids, attention_mask, output_hidden_states=True
+            # Hook-based selective capture -- see train.py's training_step
+            # and generators/base.py's required_hidden_state_layers for why
+            # (avoids output_hidden_states=True's memory cost at long
+            # sequence lengths).
+            teacher_logits, hidden_states = frozen_llm.teacher_pass_selected_layers(
+                input_ids, attention_mask, generator.required_hidden_state_layers
             )
             soft_prefix = generator(prompts, hidden_states=hidden_states, attention_mask=attention_mask)
         else:
@@ -40,7 +46,10 @@ def evaluate(
 
         student_logits = frozen_llm.student_pass(input_ids, attention_mask, soft_prefix)
 
-        kl = kl_distillation_loss(teacher_logits, student_logits, generator.n_soft_tokens, attention_mask)
+        kl = kl_distillation_loss(
+            teacher_logits, student_logits, generator.n_soft_tokens, attention_mask,
+            top_k=kl_top_k, chunk_size=kl_chunk_size,
+        )
         total_kl += kl.item()
         n_batches += 1
 

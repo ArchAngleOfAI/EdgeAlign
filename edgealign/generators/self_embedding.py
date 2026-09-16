@@ -12,10 +12,17 @@ Only this MLP is trained. There is no separate encoder to train, and the
 frozen LLM is never updated -- this module only ever *reads* hidden
 states the frozen LLM already computed during the teacher pass; it never
 runs the frozen LLM itself. That's why it declares
-needs_frozen_hidden_states = True: the training loop is responsible for
-running the teacher pass with output_hidden_states=True and handing the
-result to forward() (see edgealign/train.py training_step and
-edgealign/evaluate.py evaluate).
+needs_frozen_hidden_states = True and required_hidden_state_layers =
+[L-3, L-2, L-1]: the training loop captures exactly those three layers
+via forward hooks (FrozenLLMHarness.teacher_pass_selected_layers) and
+hands the result to forward() (see edgealign/train.py training_step and
+edgealign/evaluate.py evaluate) -- NOT via output_hidden_states=True,
+which would force the frozen model to retain every layer's output, not
+just these three. That distinction is not just an optimization: at long
+sequence lengths (e.g. seq_len=16384) output_hidden_states=True's
+memory cost (all num_hidden_layers+1 tensors, ~20GB for a 37-layer 8B
+model at that length) caused a real OOM during integration testing,
+even though only 3 of those layers were ever used.
 
 Cost tradeoff, per spec: this requires two forward passes through the
 full frozen LLM per example (the teacher/hidden-state-extraction pass,
@@ -23,7 +30,7 @@ plus the soft-prefix student pass) rather than one pass through a small
 separate encoder -- a real compute cost, traded for richer, more
 integrated representations than an independent encoder would build.
 """
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -66,6 +73,7 @@ class SelfEmbeddingGenerator(GeneratorFrontend):
         # hidden_states tuple indices for layers L-3, L-2, L-1 (L = num_hidden_layers),
         # excluding the final layer L and the pre-transformer embedding output at index 0.
         self._layer_indices = [num_hidden_layers - 3, num_hidden_layers - 2, num_hidden_layers - 1]
+        self.required_hidden_state_layers = self._layer_indices
 
         concat_dim = 3 * hidden_size
         self.mlp = nn.Sequential(
@@ -82,15 +90,15 @@ class SelfEmbeddingGenerator(GeneratorFrontend):
         self,
         prompts: List[str],
         contexts: Optional[List[str]] = None,
-        hidden_states: Optional[Sequence[torch.Tensor]] = None,
+        hidden_states: Optional[Dict[int, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if hidden_states is None or attention_mask is None:
             raise ValueError(
                 "SelfEmbeddingGenerator requires hidden_states and attention_mask from "
                 "the frozen LLM's teacher pass (needs_frozen_hidden_states=True) -- the "
-                "training loop must call teacher_pass(..., output_hidden_states=True) "
-                "and pass the result through."
+                "training loop must call teacher_pass_selected_layers(..., "
+                "self.required_hidden_state_layers) and pass the result through."
             )
 
         device = self.out.weight.device

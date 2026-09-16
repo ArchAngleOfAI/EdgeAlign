@@ -8,7 +8,7 @@ forced to False on construction. Gradients still flow *through* the
 frozen model's activations into the soft-prefix embeddings during the
 student pass, since that pass is never wrapped in torch.no_grad().
 """
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -43,12 +43,31 @@ class FrozenLLMHarness:
         )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+
+        max_memory = None
+        if model_config.max_memory_gib is not None and torch.cuda.is_available():
+            cap = f"{model_config.max_memory_gib}GiB"
+            max_memory = {i: cap for i in range(torch.cuda.device_count())}
+
         model = AutoModelForCausalLM.from_pretrained(
             model_config.name_or_path,
             torch_dtype=dtype,
             device_map=model_config.device_map,
+            max_memory=max_memory,
             trust_remote_code=model_config.trust_remote_code,
         )
+
+        devices = {str(p.device) for p in model.parameters()}
+        if "meta" in devices:
+            raise RuntimeError(
+                f"model partially loaded onto the meta device -- devices seen: {devices}. "
+                f"device_map=\"auto\" couldn't find enough memory across the visible GPUs at "
+                f"load time. On a shared cluster this can be genuine insufficient capacity, or "
+                f"transient contention from another process at the exact moment of loading "
+                f"(confirmed to happen -- see MEMORY.md); check GPU memory and retry before "
+                f"assuming more/larger GPUs are needed."
+            )
+
         return cls(model, tokenizer)
 
     @property
@@ -87,6 +106,59 @@ class FrozenLLMHarness:
         if output_hidden_states:
             return out.logits, out.hidden_states
         return out.logits
+
+    def teacher_pass_selected_layers(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        layer_indices: List[int],
+    ):
+        """Like teacher_pass(output_hidden_states=True), but captures
+        ONLY the requested layers via forward hooks instead of asking
+        the model to materialize every layer's output.
+
+        output_hidden_states=True forces HF to retain all
+        num_hidden_layers+1 intermediate tensors regardless of how many
+        are actually used downstream -- at long sequence lengths this is
+        a real, large memory cost (e.g. ~20GB for a 37-layer model at
+        seq_len=16384, batch=4, even though a generator like
+        self-embedding only reads 3 of them). This method only ever
+        holds the requested layers in memory.
+
+        layer_indices use the same convention as the output_hidden_states
+        tuple: index 0 is the embedding output (not reachable here -- use
+        output_hidden_states=True if index 0 is ever needed), index i
+        (1 <= i <= num_hidden_layers) is decoder layer i's output, i.e.
+        `self.model.model.layers[i - 1]`'s output.
+
+        Returns (logits, {index: tensor}).
+        """
+        captured: Dict[int, torch.Tensor] = {}
+        handles = []
+
+        def make_hook(idx: int):
+            def hook(module, inputs, output):
+                captured[idx] = output[0] if isinstance(output, tuple) else output
+
+            return hook
+
+        decoder_layers = self.model.model.layers
+        for idx in layer_indices:
+            if idx < 1:
+                raise ValueError(
+                    f"layer index {idx} is out of range for hook-based capture -- index 0 "
+                    f"(the embedding output) isn't a decoder layer; use output_hidden_states=True instead"
+                )
+            handles.append(decoder_layers[idx - 1].register_forward_hook(make_hook(idx)))
+
+        try:
+            with torch.no_grad():
+                out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        return out.logits, captured
 
     def student_pass(
         self,

@@ -12,12 +12,12 @@ their own tokenization/encoding, with no dependency on the frozen main
 LLM. v2 (self-embedding) is different by design -- it has no separate
 encoder and instead needs the frozen LLM's own hidden states as its
 input, which only exist after a forward pass through that LLM. The
-`needs_frozen_hidden_states` flag and the extra `hidden_states`/
-`attention_mask` forward() arguments below exist ONLY to support that
-case; a front-end that doesn't set the flag never receives them and can
-ignore both.
+`needs_frozen_hidden_states` flag, `required_hidden_state_layers`, and
+the extra `hidden_states`/`attention_mask` forward() arguments below
+exist ONLY to support that case; a front-end that doesn't set the flag
+never receives them and can ignore all of it.
 """
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -40,16 +40,31 @@ class GeneratorFrontend(nn.Module):
 
     # Set True by a variant (only v2 today) that needs the frozen main
     # LLM's own hidden states as input. When True, the training loop
-    # runs the teacher pass with output_hidden_states=True and passes the
-    # result through to forward() below instead of relying on prompts
-    # alone.
+    # captures ONLY the layers named in required_hidden_state_layers
+    # (via FrozenLLMHarness.teacher_pass_selected_layers -- forward
+    # hooks, not output_hidden_states=True) and passes the result
+    # through to forward() below instead of relying on prompts alone.
+    # A generator that sets needs_frozen_hidden_states=True MUST also
+    # set required_hidden_state_layers to a concrete list of indices
+    # (the output_hidden_states-tuple convention: index i, 1 <=
+    # i <= num_hidden_layers, is decoder layer i's output; index 0, the
+    # embedding output, is not capturable this way).
+    #
+    # Why this matters, not just an optimization: output_hidden_states=
+    # True forces the frozen model to retain every layer's output
+    # simultaneously, which at long sequence lengths is a real, large
+    # memory cost regardless of how many layers are actually used
+    # downstream (e.g. ~20GB for a 37-layer 8B model at seq_len=16384,
+    # batch=4, to read only 3 layers) -- confirmed by an actual OOM
+    # during real-config integration testing, not just theory.
     needs_frozen_hidden_states: bool = False
+    required_hidden_state_layers: Optional[List[int]] = None
 
     def forward(
         self,
         prompts: List[str],
         contexts: Optional[List[str]] = None,
-        hidden_states: Optional[Sequence[torch.Tensor]] = None,
+        hidden_states: Optional[Dict[int, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Returns a (batch, n_soft_tokens, embedding_dim) tensor.
@@ -57,6 +72,8 @@ class GeneratorFrontend(nn.Module):
         hidden_states/attention_mask are only ever populated when
         needs_frozen_hidden_states is True (see above) -- variants that
         don't set that flag can ignore both parameters entirely.
+        hidden_states is keyed by the same indices listed in
+        required_hidden_state_layers, not a plain 0-indexed sequence.
         """
         raise NotImplementedError
 

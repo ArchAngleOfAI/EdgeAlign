@@ -9,3 +9,11 @@ numpy>=1.26
 # (scripts/prepare_stack_edu.py) -- not required for local smoke testing.
 boto3>=1.34
 smart_open[s3]>=6.4
+
+# Needed only on the GPU training cluster, for the fused KL-divergence
+# kernel in edgealign/losses.py (real vocab_size=151936 makes the plain
+# PyTorch KL computation itself a memory bottleneck -- see MEMORY.md).
+# Requires Triton/CUDA; edgealign/losses.py falls back to plain
+# F.kl_div automatically when this isn't installed or CUDA isn't
+# available, so it's not required for local (CPU) smoke testing.
+liger-kernel>=0.8.2
