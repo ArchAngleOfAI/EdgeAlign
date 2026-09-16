@@ -7,61 +7,79 @@ MEMORY.md, not here.
 
 ## Last updated
 
-2026-09-15 (switched working target to Qwen 3 8B)
+2026-09-16 (real-scale training infra + GPU fault investigation, all
+committed/pushed)
 
 ## Status
 
 - `main`: shared infrastructure, committed/pushed (`0a64ba5`).
-- `self-embedding` branch, all pushed as of last note:
-  `2d9cfc5` (v2 generator), `74506dc` (Wikipedia dataloader),
-  `86dcc44` (real Qwen3-32B smoke test + bf16 bug found). **This
-  session's Qwen3-8B switch (configs/qwen3_8b.yaml, new smoke test
-  scripts, doc updates below) is NOT committed/pushed yet.**
-- **Decided: prototyping directly on Qwen 3 8B for now, not the
-  originally-intended 32B.** 32B has an unresolved real bf16 bug in its
-  own frozen forward pass (tried and disproved: transformers version
-  pin 4.51.0 — didn't fix it, made it worse). 8B is fully verified:
-  forward path clean, and a full real-weights training-loop smoke test
-  passes with a sane loss trajectory. Along the way, also found and
-  fixed a *second*, unrelated issue: the smoke tests' hardcoded
-  `learning_rate=0.01` (borrowed from tiny-toy-model tests) caused a
-  finite-but-wildly-unstable loss on real 8B activations; `0.0001`
-  (matching the real training config) is stable. Fixed in both real
-  smoke test scripts, plus added a sanity-bound assertion
-  (`max(history) < 20`) so this class of "technically finite but
-  actually broken" result can't silently read as PASSED again.
-- **This status is now reflected everywhere**, per explicit request:
-  `MEMORY.md` (new banner at the top, updated Phase 1 description,
-  full "Working target switched" section), `README.md` (branch banner,
-  repo layout, running instructions), `PROMPTS/soft_prompt_generator_infrastructure_spec.md`
-  and `PROMPTS/soft_prompt_generator_spec_v2_self_embedding.md`
-  (implementation notes near their respective "target the 32B" lines).
-  `configs/qwen3_8b.yaml` is new (the config actually in use);
-  `configs/prototype_32b.yaml` kept as-is with a warning, ready for
-  when the bug is fixed.
-- GPU etiquette unchanged: check `nvidia-smi` before each run. No
-  orphaned processes/GPU memory left behind after any run this session
-  — verified each time.
+- `self-embedding` branch: everything through this session is now
+  committed and pushed. See MEMORY.md for the full technical detail;
+  this is the short version.
+- **Training config system is real now**: `edgealign/config.py`'s
+  `TrainConfig` supports `grad_accum_steps`, `optimizer`/`optimizer_kwargs`,
+  `lr_scheduler`/`warmup_steps`/`lr_scheduler_kwargs`, `num_gpus`/
+  `available_gpus` (sets `CUDA_VISIBLE_DEVICES` before any CUDA call),
+  and `checkpoint_every` (periodic save + auto-resume in
+  `run_training`).
+- **Two real bugs found and fixed** while scaling toward the user's
+  target config (`seq_len=16384, batch=4, grad_accum=4, 4 GPUs`):
+  hook-based selective hidden-state capture (was retaining all 37
+  layers via `output_hidden_states=True`), and the KL loss's full-vocab
+  float32 materialization (fixed via Liger Kernel + top-k + sequence
+  chunking, all verified numerically exact/near-exact against the
+  original). Both are in `edgealign/losses.py`/`edgealign/frozen_model.py`.
+- **A long GPU-fault investigation concluded**: what looked like "GPU 4
+  is faulty" (an earlier, honest-but-wrong finding) is actually a rare,
+  non-reproducible transient CUDA fault that occurs GPU-independently —
+  proven by running the same real step simultaneously on all 6 idle
+  GPUs and having all 6 pass right after GPU 7 alone had just failed
+  twice. Along the way, found and fixed two more real things: a genuine
+  OOM at `seq_len=4096` (confirmed via `torch.autograd.set_detect_anomaly`,
+  not assumed), and a real device-mismatch bug in
+  `edgealign/init_utils.py` (`torch.randperm` defaulting to CPU while
+  indexing a CUDA tensor). Also found (separately, still open): multi-GPU
+  `device_map="auto"` sharding silently corrupts Qwen3-8B's numerics —
+  confirmed via a clean single-GPU-vs-2-GPU logit comparison. Practical
+  fix applied: single-GPU only for now (see `configs/qwen3_8b.yaml`).
+- **Built a checkpoint + restart recovery system** for the (confirmed
+  sticky, no safe in-process recovery) CUDA fault:
+  `TrainConfig.checkpoint_every` + auto-resume in `run_training`,
+  `main()` exits with a sentinel code on that specific fault class, and
+  `scripts/train_with_restart.sh` restarts a fresh process on that
+  code only. Verified locally (resume test) and on the cluster
+  (10/10 correct restarts during a sporadic-fault run).
+- GPU 1 has been independently reported (by the cluster's other users)
+  to currently be out of order — avoid it. This is unrelated to the
+  now-disproven "GPU 4" finding.
+- GPU etiquette unchanged: check `nvidia-smi` before each run.
 
 ## Pending / needs user decision
 
-- **Commit + push this session's work** — the 8B switch (config,
-  scripts, LR fix) and all the doc updates above are uncommitted.
-- Root cause of the 32B bf16 bug is still technically open (depth vs.
-  multi-GPU sharding, undisambiguated) but is no longer blocking
-  progress now that 8B is the working target — revisit only if/when
-  32B is needed again.
-- Whether/when to clean up `.venv_tf451` on the cluster (transformers
-  4.51.0 test env, no longer needed now that the version-pin hypothesis
-  is closed) — not urgent, ~55GB still free there.
+- No real (non-smoke, to-convergence) training run has been started
+  yet — this session was entirely verification/infrastructure/debugging.
+  Next real attempt should use `configs/qwen3_8b.yaml` via
+  `scripts/train_with_restart.sh`, single GPU, `seq_len=2048`.
+- The multi-GPU `device_map="auto"` sharding-corruption bug is
+  unresolved (root cause not isolated) — blocks getting back to the
+  originally-requested `seq_len=16384`/multi-GPU config; a single
+  40GB GPU is the real current memory ceiling.
+- The sporadic CUDA fault itself is still unexplained at the root
+  (best guess: rare transient condition on this heavily shared node);
+  the checkpoint+restart system mitigates it but doesn't fix it, and
+  does NOT help if it starts occurring on every attempt in a row
+  (observed once, under unusually heavy concurrent node load).
+- Whether/when to clean up `.venv_tf451` and the newer
+  `.venv_torch_stable` on the cluster (both were disproof-of-hypothesis
+  throwaway envs, no longer needed) — not urgent.
 - Whether to open a PR for `self-embedding` → `main`.
-- `files.zip` duplicate, v1/v3 unimplemented, `/data` cluster access,
-  AWS creds for Stack-Edu — all long-standing, unchanged.
+- `files.zip` duplicate, v1/v3 unimplemented, AWS creds for Stack-Edu —
+  all long-standing, unchanged.
 
 ## Immediate next steps
 
-- Commit + push.
-- Real (non-smoke) training run on Qwen 3 8B + Wikipedia data
-  (`configs/qwen3_8b.yaml`), to see if KL distillation actually
-  converges over a real run, not just a few smoke-test steps.
+- Kick off a real (longer, to-convergence) training run via
+  `scripts/train_with_restart.sh configs/qwen3_8b.yaml`.
+- Revisit the multi-GPU sharding bug if/when more memory budget is
+  needed (currently blocked at single-GPU, `seq_len=2048`).
 - No RL-stage spec exists yet in PROMPTS/.

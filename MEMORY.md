@@ -640,6 +640,318 @@ work. A generator trained against a frozen model that is itself
 producing degenerate output cannot possibly learn anything meaningful,
 regardless of how correct the generator's own code is.
 
+## Cluster GPU topology, and the peer-access fault (2026-09-16, corrected 2026-09-16)
+
+**Superseded finding, kept for the record: "GPU 4 is the culprit" was
+WRONG.** An earlier note here concluded GPU 4 specifically was faulty
+because every failing combination happened to include it and `[1, 3]`
+(excluding it) got further. That was a real, honest finding at the
+time but a false lead — later, more controlled testing directly
+disproved it (see below). Do not re-derive "avoid GPU 4" from this
+history; there is no confirmed bad GPU on this node.
+
+**What actually explains the recurring fault** (`torch.AcceleratorError:
+CUDA error: Invalid access of peer GPU memory over nvlink or a hardware
+error` / `CUDA_ERROR_CONTAINED`, driver messages sometimes reading
+"Sticky error detected" / `cudaErrorContained` from `cuStreamSynchronize`,
+`cuMemFree_v2`, or `cuStreamGetCaptureInfo_v3`) — established through a
+long, methodical elimination, not guessed:
+
+1. **Not GPU-specific.** The identical fault reproduced on GPU 1 alone,
+   GPU 7 alone, GPU 5 alone, and various pairs — every GPU on the node
+   has shown it at some point. Decisively: a controlled test ran the
+   exact same real forward+backward step **simultaneously on all 6
+   currently-idle GPUs (1, 3, 4, 5, 6, 7)** — all 6 passed cleanly in
+   the same run in which GPU 7 alone had just failed twice in a row
+   moments earlier. If any GPU were actually defective, it would fail
+   this test deterministically; none did. **There is no bad GPU to
+   avoid.**
+2. **Not "NVLink" despite the message.** `nvidia-smi topo -m` shows
+   these are PCIe-only A100s with no NVLink hardware between any pair
+   on this box — confirmed the fault occurs on a *single* GPU with zero
+   peer/cross-device traffic involved at all, so "peer GPU memory over
+   nvlink" is generic/inaccurate boilerplate for this CUDA error code,
+   not a literal description of the cause.
+3. **Not MIG, not another tenant's process, not GPU-level contention in
+   the usual sense.** MIG is disabled on every GPU; at the moment of
+   several failures the target GPU had zero other processes, 0% prior
+   utilization, clean ECC/remapped-rows/retired-pages, no throttling,
+   no MPS, no containers, nothing holding `/dev/nvidia<N>` open
+   (`fuser`/`lsof` both empty). `dmesg`/`journalctl` kernel logs (where
+   a real Xid hardware error would show up) are not readable without
+   `sudo`, which was not used.
+4. **Not the CUDA/driver/torch version.** The node's torch (2.14.0,
+   the latest PyPI release at the time) paired with driver 595.58.03
+   was a real suspect (bleeding-edge stack). Built an isolated venv
+   (`.venv_torch_stable` on the cluster) with torch 2.9.0+cu126
+   instead — the identical fault still occurred, just reported as an
+   unrecognized error code (the older CUDA runtime has no string for
+   whatever code the driver returns) instead of the named
+   `cudaErrorContained`. Two different torch/CUDA-toolkit generations
+   hitting the same underlying condition rules out a torch-version bug.
+5. **Two genuine, different, *fixable* things were hiding inside "the
+   fault" and got found by not stopping at the first plausible
+   explanation:**
+   - A real out-of-memory condition, confirmed directly (not inferred)
+     by running with `torch.autograd.set_detect_anomaly(True)`, which
+     forces synchronous CUDA error reporting: the exact same code path
+     that normally raised the generic peer-access error instead raised
+     a plain `torch.OutOfMemoryError` at 37.9/39.5 GB used, at
+     `seq_len=4096, batch=1` on a single GPU. PyTorch's *asynchronous*
+     CUDA error reporting means a real OOM on one CUDA stream is often
+     only surfaced by a *later, unrelated* CUDA call, with whatever
+     generic error code the now-corrupted context happens to report —
+     this is why the crash site kept moving between runs and why it
+     looked hardware-flavored. Fixed operationally: halved
+     `max_seq_len` (4096→2048) and `kl_chunk_size` (512→256) in
+     `configs/qwen3_8b.yaml`, since most of the seq_len-scaling memory
+     (student-pass activations across 36 layers, the logits tensor and
+     its gradient) is ~linear in seq_len, not quadratic (SDPA doesn't
+     materialize a full seq² attention matrix here).
+   - A real device-mismatch bug in our own code, unrelated to the
+     cluster: `edgealign/init_utils.py`'s `compute_embedding_scale_stats`
+     called `torch.randperm(vocab_size, generator=generator)` with no
+     `device=`, defaulting to CPU, then indexed a CUDA tensor
+     (`weight[idx]`) with it — an unusual pattern (implicit CPU→GPU
+     index transfer right after a large bulk weight load) that a normal
+     inference workload would never hit. **Fixed**: pass
+     `device=weight.device` explicitly. Confirmed via a dedicated local
+     resume test (see below) and via the cluster no longer failing at
+     that exact line after the fix.
+6. **Multi-GPU `device_map="auto"` sharding silently corrupts Qwen3-8B's
+   numerics** — a separate, confirmed, real bug, not the crash itself
+   but found while investigating it. Same real Wikipedia data, same
+   code, same model: **single-GPU** gives correct logits
+   (`teacher_logits.abs().max() ≈ 51`, teacher/student closely
+   matching, as expected early in training); a **2-GPU** split (tried on
+   two different, fully healthy pairs — `[1,3]` and `[5,6]` — got the
+   *identical* corrupted value both times: `teacher_logits.abs().max() =
+   0.98046875`, `student_logits` NaN or exact zero). This is
+   deterministic given the shard boundary, not random, and it silently
+   produced a `kl_loss=nan` training run earlier in this same session
+   that looked like ordinary instability rather than a sharding bug.
+   Root cause not fully isolated (candidate: some buffer — e.g. RoPE
+   frequencies — not correctly replicated across the accelerate
+   dispatch boundary), but the practical fix is clear and applied:
+   **`available_gpus` is single-GPU only for this model on this
+   cluster** (see `configs/qwen3_8b.yaml`) until this is actually
+   root-caused. This also means the original multi-GPU memory-budget
+   plan (spread `seq_len=16384, batch=4` across 4 GPUs) is not viable as
+   designed — a single 40GB A100 is the real current budget.
+7. **What's left unexplained, honestly**: after both real bugs above
+   were fixed, the peer-access/sticky fault still recurs sometimes,
+   apparently at random — same exact script, same GPU, sometimes
+   passes cleanly, sometimes doesn't, with no reproducible trigger
+   found despite extensive isolation (attention backend eager vs. sdpa,
+   `device_map`, forward hooks, `requires_grad_(False)`, Liger Kernel
+   import, batch size, sequence length bisection down to 128, real vs.
+   synthetic data, `CUDA_LAUNCH_BLOCKING=1` for synchronous reporting).
+   Best-supported remaining explanation: a genuinely rare, transient
+   condition on this heavily shared (40-user, 60-day-uptime) node —
+   not tied to any specific GPU (point 1), not OOM (point 5, when
+   checked directly at the moment of failure memory usage was low,
+   e.g. 16.4/42.4 GB), not a code bug found so far. **Once this fault
+   does occur, the CUDA context becomes genuinely "sticky" for the rest
+   of that process** — confirmed directly: an in-process retry's own
+   recovery call, `torch.cuda.empty_cache()`, failed with the identical
+   `CUDA_ERROR_CONTAINED`/"Sticky error detected" message. There is no
+   safe in-process recovery once this happens; see "Checkpoint + restart
+   recovery" below for the mitigation actually built.
+
+**Practical takeaways for future sessions**:
+- Don't re-conclude a specific GPU is bad from a handful of failures on
+  it — the base rate of this fault is high enough, and it strikes
+  GPU-independently often enough, that this is a strong false-positive
+  trap. Re-run the *same* test on a couple of other idle GPUs before
+  concluding hardware.
+- Always check whether an "AcceleratorError" might actually be an OOM
+  by re-running the failing step with `torch.autograd.set_detect_anomaly(True)`
+  (or `CUDA_LAUNCH_BLOCKING=1`) before assuming it's external/hardware.
+- Multi-GPU `device_map="auto"` sharding is NOT currently trustworthy
+  for Qwen3-8B's numerics on this cluster — always spot-check
+  `teacher_logits`/`student_logits` magnitude (not just "did it crash")
+  after any change that touches GPU count.
+
+## Full training config system (2026-09-16)
+
+Extended `TrainConfig` (`edgealign/config.py`) with real knobs beyond the
+original fixed-LR/no-accumulation setup, all backward compatible
+(existing configs/smoke tests work unchanged with the new defaults):
+
+- `grad_accum_steps` — micro-batches accumulated before each optimizer
+  step. `max_steps`/`log_every`/`eval_every` all count *optimizer* steps
+  (post-accumulation), not micro-batches, so a config's `max_steps`
+  means the same thing regardless of `grad_accum_steps`.
+- `optimizer` (registry key in `train.py`'s `OPTIMIZER_REGISTRY`) +
+  `optimizer_kwargs`.
+- `lr_scheduler` (any name `transformers.get_scheduler` supports:
+  "constant", "cosine", "linear", ...) + `warmup_steps` +
+  `lr_scheduler_kwargs`. Non-"constant" schedules need a concrete
+  `max_steps` (not `None`) to compute their decay curve.
+- `num_gpus` + `available_gpus` — `train.py`'s `main()` sets
+  `CUDA_VISIBLE_DEVICES` from `available_gpus` as the very first thing,
+  before any CUDA call (must happen before `FrozenLLMHarness.from_pretrained`
+  — CUDA device visibility can't change after the driver initializes a
+  context). `num_gpus` is a sanity cross-check against
+  `len(available_gpus)`, not an independent control.
+
+Verified locally (tiny CPU model): grad_accum=4 + cosine scheduler +
+warmup=3 over 10 optimizer steps — LR correctly ramps 0→peak over the
+warmup steps then cosine-decays to 0 by the final step; exactly 40
+micro-batches consumed for 10 optimizer steps. All three pre-existing
+smoke tests re-verified passing unchanged after the change.
+
+## Scaling to the real training config -- a real debugging saga (2026-09-16)
+
+User's target real config: `seq_len=16384, batch_size=4, grad_accum=4,
+lr=1e-3, cosine schedule, warmup=5000, AdamW, 4 GPUs`. Getting there
+required finding and fixing two genuine bugs, ruling out one
+counterproductive "fix", and running into a real PyTorch/CUDA
+diagnostic quirk. In order:
+
+1. **Bug 1 (fixed): `output_hidden_states=True` retains every layer.**
+   The self-embedding generator only reads 3 of 37 layer outputs, but
+   requesting `output_hidden_states=True` forces the frozen model to
+   retain ALL of them simultaneously (~20GB at seq_len=16384, batch=4) —
+   this alone OOM'd on a single GPU before even reaching the generator.
+   **Fix**: `FrozenLLMHarness.teacher_pass_selected_layers` (forward
+   hooks on just the needed decoder layers, `frozen_model.py`) replaces
+   `output_hidden_states=True` for any generator with
+   `needs_frozen_hidden_states=True`. `GeneratorFrontend` gained
+   `required_hidden_state_layers`; `SelfEmbeddingGenerator` sets it to
+   `self._layer_indices`. `hidden_states` is now a `Dict[int, Tensor]`
+   keyed by those same indices, not a plain sequence — `forward()`'s
+   existing `hidden_states[i]` indexing needed no change. Verified: all
+   three local smoke tests still pass; on the cluster, this got a
+   4-GPU run past both the frozen model's forward pass AND the
+   generator's own pooling (previously the earliest failure points).
+2. **Bug 2 (fixed): the KL loss materializes the full vocab tensor.**
+   `kl_distillation_loss` casts both logits to float32 and runs
+   `log_softmax` over the real vocab (151,936) for the whole sequence at
+   once — at `batch=2, seq=4096` alone this needed ~4.3GB for one
+   intermediate tensor. Invisible in smoke tests (`vocab_size=512`
+   there). Considered chunking (sequence-dim or vocab-dim), a plain
+   bf16-no-upcast tweak, and Liger Kernel; user chose Liger Kernel, and
+   specifically its **stable** `LigerKLDIVLoss` (not the unreleased
+   `LigerFusedLinearKLDivLoss`, merged upstream literally the day before
+   and not in any pip release — that one would avoid materializing
+   logits at all via a fused linear+KL kernel, but was judged too
+   bleeding-edge). **Fix**: `edgealign/losses.py` now tries
+   `from liger_kernel.transformers import LigerKLDIVLoss` at import
+   time; used only when the tensors are actually on CUDA (`is_cuda`
+   check at call time, not just import time) — CPU/no-liger always
+   falls back to the original `F.kl_div` path unchanged, so local smoke
+   tests need no dependency and are untouched by this. One real API
+   quirk found by testing, not assumed: Liger's kernel expects a
+   **flattened `(batch*seq, vocab)`** input, not `(batch, seq, vocab)` —
+   reshape before/after. Directly verified both forward (max abs diff
+   ~1.2e-7) and backward (grad max abs diff ~1.9e-9) match `F.kl_div`
+   exactly before trusting it. Added `liger-kernel>=0.8.2` to
+   `requirements.txt`, marked cluster-only (needs Triton/CUDA).
+3. **False lead, reverted: `max_memory_gib` safety margin.** After two
+   consecutive load-time failures (model partially offloaded to `meta`
+   device) that *looked* like external contention (the OOM error's
+   "other processes on this GPU" listing named a real PID with ~36GB in
+   use), added a per-GPU memory cap (`ModelConfig.max_memory_gib`,
+   `FrozenLLMHarness.from_pretrained`) meant to leave headroom against
+   exactly that. **It made things worse** — reverting it (`max_memory_gib:
+   None`) let the same config load successfully, confirmed directly by
+   toggling the one setting back and forth. Root cause of the original
+   "contention": a genuine **PyTorch/NVML diagnostic quirk** — when
+   `CUDA_VISIBLE_DEVICES` restricts visible devices, the OOM error's
+   supplementary "other processes on this device" listing is built from
+   NVML physical indices, not the CUDA-runtime-remapped local indices
+   used everywhere else in the same error message. So "GPU 1" in the
+   main error text correctly meant our own local index 1 (physical GPU
+   4, genuinely tight on memory), while the "Process 3781298" mentioned
+   alongside it was actually on unrelated *physical* GPU 1 — a
+   coincidental collision between two different indexing systems both
+   printing "1", not real contention. Verified directly: cross-referenced
+   the PID against `nvidia-smi --query-compute-apps` + `--query-gpu=uuid`
+   to confirm its true physical GPU didn't match ours. The
+   `max_memory_gib` knob itself is kept in the codebase (harmless, off
+   by default) since it's a real, legitimate lever in principle — just
+   not the fix for this particular symptom. **Lesson for future
+   debugging: don't trust the "other processes" list in a CUDA OOM
+   error when CUDA_VISIBLE_DEVICES is set — cross-reference PIDs against
+   `nvidia-smi --query-gpu=uuid` before concluding it's external
+   contention.**
+4. **Genuine remaining constraint: 2 GPUs is a tight fit, 4 has real
+   margin.** With both real bugs fixed and the false lead reverted, 2
+   free GPUs (`batch=2, seq_len=4096`) succeeded *intermittently* —
+   same config, no code change, sometimes loads fine, sometimes hits
+   the same meta-device failure moments later purely from this heavily-
+   shared cluster's genuine, constantly-fluctuating other-user memory
+   usage (confirmed via repeated `nvidia-smi` snapshots throughout this
+   session showing different GPUs occupied every few minutes). Not
+   fragile in our own code — fragile because 2×40GB is close to the
+   real requirement at that scale, so any external fluctuation tips it
+   over. 4 GPUs gives real headroom instead of living at the edge.
+
+**This section's original ending (re-verifying `batch=4, seq_len=4096,
+4 GPUs`) is superseded** — see "Cluster GPU topology, and the
+peer-access fault" above (corrected) for what that re-verification
+actually turned up: the multi-GPU sharding numerics bug, and the real
+OOM at that seq_len. Current real config is single-GPU,
+`seq_len=2048`, `kl_chunk_size=256` — see `configs/qwen3_8b.yaml`.
+
+## Checkpoint + restart recovery for the sticky CUDA fault (2026-09-16)
+
+Since the peer-access fault above is confirmed *sticky* (no safe
+in-process recovery — see point 7 in the section above) but genuinely
+rare/transient rather than deterministic, the practical mitigation is
+process-level: checkpoint periodically, and restart a fresh process
+when it happens.
+
+- `TrainConfig.checkpoint_every` (default `0` = disabled): every this
+  many *optimizer* steps, `run_training` (`edgealign/train.py`) saves
+  generator + optimizer + scheduler state dicts, `global_step`, and the
+  full loss `history` to `<output_dir>/checkpoint.pt`.
+- `run_training` auto-resumes from that file if it exists at start —
+  no separate resume flag needed. The data iterator itself is
+  deliberately NOT checkpointed (it's a streaming corpus); a resumed
+  run continues consuming fresh batches rather than replaying the
+  exact pre-restart sequence. Acceptable for this self-distillation
+  warm-start, not treated as a correctness requirement.
+- `main()` catches `torch.AcceleratorError` / `torch.OutOfMemoryError`
+  around the whole load+train call, prints the full traceback (so the
+  real failure site is never lost, unlike the first version of this
+  handler), and exits with a distinct sentinel code
+  (`edgealign.train.STICKY_CUDA_FAULT_EXIT_CODE = 42`) — deliberately
+  making no further CUDA calls itself (even `torch.cuda.empty_cache()`
+  is unsafe post-fault, per point 7 above).
+- `scripts/train_with_restart.sh <config.yaml> [max_restarts]` loops
+  `python -m edgealign.train --config <config.yaml>`, restarting (after
+  a short sleep) only on exit code 42; any other exit code (0 = done,
+  anything else = a real bug/config error) stops immediately instead of
+  masking it as a restart-worthy fault.
+- Verified locally: a dedicated resume test (tiny CPU model, 3 steps +
+  checkpoint, then a fresh `run_training` call with `max_steps=5`
+  against the same `output_dir`) confirms it resumes from
+  `global_step=3` and runs exactly 2 more steps, returning the full
+  5-entry trajectory. On the cluster, `train_with_restart.sh` was
+  observed correctly restarting 10/10 times on the sentinel code during
+  a run of sporadic faults, and correctly not treating other errors as
+  restart-worthy.
+
+**Known limitation, not yet hit in practice but worth knowing**: if the
+sticky fault recurs on *every* attempt in a row (observed once, when
+the node had unusually heavy concurrent load from another user's
+tensor-parallel job), restarting doesn't help — it just burns through
+`max_restarts` and gives up. The restart mechanism helps with rare,
+sparse faults; it is not a fix for sustained unavailability.
+
+**Status as of this note**: single-GPU (any idle GPU; GPU 1 has also
+been independently reported to be currently out of order by the
+cluster's other users — avoid it specifically, separately from the
+now-disproven "GPU 4" finding above), `seq_len=2048`, `batch_size=1`,
+`kl_chunk_size=256`, `checkpoint_every` set, restart script in place.
+Real training run to convergence has not yet been started — this was
+all verification/infrastructure work. `seq_len` is still far below the
+originally-requested 16384; revisiting that is blocked on the
+multi-GPU sharding bug (point 6 above) being root-caused, since a
+single GPU's ~40GB is the real ceiling until then.
+
 ## Git structure
 
 - Repo did not exist before 2026-09-14; initialized fresh by the agent that
