@@ -28,6 +28,10 @@ model:
   dtype: "bfloat16"
   device_map: "auto"
   trust_remote_code: false
+  # max_memory_gib intentionally NOT set -- tried 38 as a safety margin,
+  # it made things worse (broke loading entirely) rather than helping.
+  # The "contention" that motivated it was a misread of a PyTorch/NVML
+  # diagnostic quirk with CUDA_VISIBLE_DEVICES, not real. See MEMORY.md.
 
 generator:
   type: "self_embedding"
@@ -36,18 +40,33 @@ generator:
 
 data:
   mode: "wikipedia"
-  max_seq_len: 512
-  batch_size: 8
+  max_seq_len: 2048   # halved from 4096 -- real OOM (not a hardware fault, see MEMORY.md) was at ~38GB/40GB;
+                       # most of the seq_len-scaling activation/logits memory is ~linear in seq_len, so this
+                       # should roughly halve that portion and leave real margin.
+  batch_size: 1   # batch=2 still OOM'd (deeper into student pass, at lm_head) -- see MEMORY.md
   eval_fraction: 0.02
   max_eval_batches: 50
   wikipedia_tar_path: "/data/r50058044/reskill_search/retriever/wiki-18.jsonl"
   wikipedia_shuffle_buffer_size: 10000
 
 train:
-  learning_rate: 0.0001
+  learning_rate: 0.001
   max_steps: 20000
   eval_every: 500
   aux_loss_weight: 0.01
   log_every: 20
   seed: 0
   output_dir: "checkpoints/qwen3_8b_run"
+  grad_accum_steps: 4
+  optimizer: "adamw"
+  lr_scheduler: "cosine"
+  warmup_steps: 5000
+  num_gpus: 1
+  available_gpus: [7]   # single-GPU only -- device_map="auto" multi-GPU sharding was confirmed to silently
+                         # corrupt Qwen3-8B's forward pass (tiny logits, NaN/zero student logits) even on
+                         # healthy GPU pairs; GPU 1 is also known out of order. GPU 5 picked up a real
+                         # vLLM tensor-parallel job (with GPU 1) mid-session -- pick whichever GPU is
+                         # actually free via nvidia-smi before each run, this is just the last value used.
+  kl_top_k: 1024   # top-K approximation on the KL loss -- exact log_softmax over the full 151936 vocab OOM'd on its own even with Liger's kernel wired in, see MEMORY.md
+  kl_chunk_size: 256   # halved from 512 alongside max_seq_len
+  checkpoint_every: 20   # matches log_every -- see MEMORY.md / scripts/train_with_restart.sh for why this exists
