@@ -17,7 +17,7 @@ def compute_embedding_scale_stats(
     weight = frozen_llm.model.get_input_embeddings().weight.detach().float()
     vocab_size = weight.shape[0]
     k = min(sample_size, vocab_size)
-    idx = torch.randperm(vocab_size, generator=generator)[:k]
+    idx = torch.randperm(vocab_size, generator=generator, device=weight.device)[:k]
     sample = weight[idx]
     return {
         "mean": sample.mean(dim=0),
