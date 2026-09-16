@@ -21,6 +21,16 @@ class ModelConfig:
     dtype: str = "bfloat16"
     device_map: str = "auto"
     trust_remote_code: bool = False
+    # Per-GPU memory cap (GiB) passed to from_pretrained's max_memory,
+    # applied uniformly to every visible CUDA device. None = let
+    # device_map="auto" use the full reported-free memory on each GPU.
+    # On a shared cluster, using every last free MB makes loading
+    # fragile to momentary contention from other users' jobs (confirmed
+    # directly: two consecutive load-time failures despite nvidia-smi
+    # showing the GPUs fully free immediately before and after each
+    # attempt -- see MEMORY.md). A small margin below the real capacity
+    # trades a bit of usable memory for headroom against exactly that.
+    max_memory_gib: Optional[float] = None
 
 
 @dataclass
@@ -76,6 +86,64 @@ class TrainConfig:
     log_every: int = 10
     seed: int = 0
     output_dir: str = "checkpoints/run"
+
+    # KL loss memory controls (edgealign/losses.py kl_distillation_loss)
+    # -- both None by default (exact, unchanged behavior). At the real
+    # vocab_size=151936, the float32+log_softmax step alone can OOM
+    # before Liger's kernel is even involved; see MEMORY.md.
+    kl_top_k: Optional[int] = None
+    kl_chunk_size: Optional[int] = None
+
+    # Gradient accumulation: this many micro-batches (each of
+    # data.batch_size) are accumulated before each optimizer step.
+    # Effective batch size = data.batch_size * grad_accum_steps.
+    # max_steps/log_every/eval_every all count optimizer steps (after
+    # accumulation), not micro-batches. 1 = no accumulation, one
+    # optimizer step per micro-batch (previous, still-default behavior).
+    grad_accum_steps: int = 1
+
+    # Optimizer registry key (edgealign/train.py's OPTIMIZER_REGISTRY),
+    # plus any extra constructor kwargs beyond lr (e.g. weight_decay,
+    # betas).
+    optimizer: str = "adamw"
+    optimizer_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    # LR schedule: any name transformers.get_scheduler supports
+    # ("constant", "linear", "cosine", "cosine_with_restarts",
+    # "polynomial", "constant_with_warmup", ...). "constant" with
+    # warmup_steps=0 reproduces the previous fixed-LR-forever behavior
+    # exactly. A non-"constant" schedule needs a concrete max_steps (not
+    # None) to compute its decay curve against.
+    lr_scheduler: str = "constant"
+    warmup_steps: int = 0
+    lr_scheduler_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    # GPU restriction: if set, edgealign/train.py's main() sets
+    # CUDA_VISIBLE_DEVICES to exactly this list before any CUDA call is
+    # made (must happen before FrozenLLMHarness.from_pretrained -- CUDA
+    # device visibility can't be changed after the driver has already
+    # initialized a context). num_gpus, if set, is cross-checked against
+    # len(available_gpus) as a sanity guard, not an independent control.
+    num_gpus: Optional[int] = None
+    available_gpus: List[int] = field(default_factory=list)
+
+    # Save generator+optimizer+scheduler+step state to
+    # "<output_dir>/checkpoint.pt" every this many optimizer steps. 0
+    # disables checkpointing. run_training() auto-resumes from this file
+    # if it already exists at start (the data iterator itself is NOT
+    # checkpointed -- it's a streaming corpus, so a resumed run continues
+    # consuming fresh batches rather than replaying the exact pre-restart
+    # sequence; acceptable for this self-distillation warm-start, not a
+    # correctness requirement).
+    #
+    # This exists because torch.AcceleratorError / torch.OutOfMemoryError
+    # have been confirmed on this cluster to be rare, non-reproducible
+    # *sticky* CUDA context faults (see MEMORY.md): once one occurs, every
+    # further CUDA call in that same process fails identically (confirmed
+    # even for torch.cuda.empty_cache()), so there is no safe in-process
+    # retry -- recovery requires a fresh process, which is what
+    # scripts/train_with_restart.sh does, resuming from this checkpoint.
+    checkpoint_every: int = 0
 
 
 @dataclass
